@@ -1,6 +1,6 @@
 # AI IT Support Assistant
 
-An agentic AI IT-support chatbot built with **LangGraph**, **Anthropic's Claude**, and **Streamlit**. It understands an employee's request, decides which tool it needs, executes that tool against local sample data, and returns a clear, grounded response — while holding onto context (like an employee ID) across multiple turns of conversation.
+An agentic AI IT-support chatbot built with **LangGraph**, **openrouter**, and **Streamlit**. It understands an employee's request, decides which tool it needs, executes that tool against local sample data, and returns a clear, grounded response — while holding onto context (like an employee ID) across multiple turns of conversation.
 
 ---
 

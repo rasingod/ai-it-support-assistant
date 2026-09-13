@@ -1,0 +1,44 @@
+[
+  {
+    "article_id": "KB-001",
+    "title": "How to reset your VPN password",
+    "tags": ["vpn", "password", "reset", "login", "network"],
+    "content": "1. Go to https://vpn-reset.fictionalcorp.com. 2. Enter your employee ID and registered email. 3. Click 'Send reset link' and check your email within 5 minutes. 4. Open the link and set a new password (minimum 10 characters, at least 1 number and 1 symbol). 5. Restart the VPN client and log in with the new password. If the reset link does not arrive, check your spam folder or raise a ticket under category 'VPN'."
+  },
+  {
+    "article_id": "KB-002",
+    "title": "VPN connection keeps dropping",
+    "tags": ["vpn", "connection", "disconnect", "network", "unstable"],
+    "content": "1. Switch off Wi-Fi and reconnect, or plug in an ethernet cable if possible. 2. Update the VPN client to the latest version from the Software Center. 3. Disable any other proxy or VPN software running at the same time. 4. Restart your machine. If the issue persists after these steps, raise a ticket under category 'VPN' with your OS version and error message."
+  },
+  {
+    "article_id": "KB-003",
+    "title": "Laptop running slow or overheating",
+    "tags": ["laptop", "slow", "performance", "overheat", "battery", "hardware"],
+    "content": "1. Restart the laptop and close unused background applications. 2. Check Task Manager / Activity Monitor for high CPU or memory usage processes. 3. Ensure laptop vents are not blocked and clean dust if possible. 4. Run Windows Update / macOS Software Update. 5. If overheating continues or the laptop shuts down unexpectedly, this may be a hardware issue — raise a ticket under category 'Laptop' for a hardware inspection."
+  },
+  {
+    "article_id": "KB-004",
+    "title": "Not receiving emails from external senders",
+    "tags": ["email", "outlook", "not receiving", "spam", "external"],
+    "content": "1. Check your Junk/Spam folder. 2. Verify with the sender that the email address used is correct. 3. Check if your mailbox has exceeded its storage quota (Outlook > File > Mailbox Settings). 4. Confirm there is no mail flow rule blocking external senders (ask your manager to check with IT if unsure). If none of these resolve it, raise a ticket under category 'Email' with the sender's address and approximate time the email was sent."
+  },
+  {
+    "article_id": "KB-005",
+    "title": "Printer not responding to print jobs",
+    "tags": ["printer", "print", "queue", "offline"],
+    "content": "1. Check that the printer is powered on and connected to the network (status light should be steady, not blinking). 2. Clear the print queue on your machine and resend the job. 3. Reconnect to the printer via Settings > Printers & Scanners. 4. Try printing a test page. If the printer remains offline, raise a ticket under category 'Printer' including the printer's floor/location."
+  },
+  {
+    "article_id": "KB-006",
+    "title": "How to request new software installation",
+    "tags": ["software", "install", "request", "application"],
+    "content": "1. Open the Software Center / Self Service app on your machine and search for the application. 2. If it is available, click Install — no ticket is required. 3. If the application is not listed, raise a ticket under category 'Software' with the exact name, version, and business justification. Software involving cost approval may take 2-3 business days."
+  },
+  {
+    "article_id": "KB-007",
+    "title": "Setting up multi-factor authentication (MFA)",
+    "tags": ["mfa", "2fa", "authentication", "security", "login"],
+    "content": "1. Go to https://mfa-setup.fictionalcorp.com and log in with your employee credentials. 2. Choose an authentication method: Authenticator App (recommended) or SMS. 3. Scan the QR code with your authenticator app and enter the 6-digit code to confirm. 4. Save the backup codes shown in a safe place. If you lose your MFA device, raise a ticket under category 'Account Access' for a manual reset."
+  }
+]

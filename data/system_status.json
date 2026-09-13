@@ -1,0 +1,26 @@
+[
+  {
+    "system": "VPN",
+    "status": "Operational",
+    "last_incident": null,
+    "notes": "All VPN gateways operating normally."
+  },
+  {
+    "system": "Email",
+    "status": "Degraded Performance",
+    "last_incident": "2026-08-27T07:30:00",
+    "notes": "Some users may experience delays of up to 15 minutes in external email delivery. Engineering team is investigating."
+  },
+  {
+    "system": "Wi-Fi",
+    "status": "Operational",
+    "last_incident": null,
+    "notes": "No known issues across office locations."
+  },
+  {
+    "system": "Printing Services",
+    "status": "Partial Outage",
+    "last_incident": "2026-08-28T15:00:00",
+    "notes": "3rd floor Bengaluru office printer cluster is offline. Facilities has been notified."
+  }
+]

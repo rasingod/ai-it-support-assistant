@@ -1,0 +1,44 @@
+name: Keep Streamlit App Awake
+
+# Runs every 8 hours (well under Streamlit Community Cloud's 12-hour sleep
+# threshold) and can also be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: "0 */8 * * *"
+  workflow_dispatch: {}
+
+# Needed for the heartbeat commit step below, which keeps this workflow's
+# schedule from being silently disabled by GitHub after 60 days with no
+# commits to the repo.
+permissions:
+  contents: write
+
+jobs:
+  keep-awake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visit app with a real browser to keep it awake
+        run: python keepalive/keep_awake.py
+        env:
+          STREAMLIT_APP_URL: "https://ai-it-support-assistant-demo.streamlit.app/"
+
+      - name: Heartbeat commit (keeps this schedule from being auto-disabled)
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > keepalive/.last-run
+          git config user.name "keepalive-bot"
+          git config user.email "actions@github.com"
+          git add keepalive/.last-run
+          git diff --staged --quiet || git commit -m "chore: keepalive heartbeat"
+          git push

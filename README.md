@@ -1,5 +1,4 @@
 # AI IT Support Assistant
-# AI IT Support Assistant
 
 Live demo: https://ai-it-support-assistant-demo.streamlit.app/
 
@@ -24,11 +23,11 @@ The assistant is built as a **LangGraph** state machine with four capabilities e
 | Tool | Purpose |
 |---|---|
 | `search_knowledge_base` | Searches a local IT knowledge base for how-to articles |
-| `lookup_tickets` | Looks up existing tickets by employee ID or ticket ID |
-| `create_ticket` | Creates a new ticket after validating required fields and checking for duplicates |
-| `check_system_status` *(bonus)* | Reports current status of internal systems (VPN, Email, Wi-Fi, Printing) |
+| `lookup_tickets` | Looks up existing tickets within the selected employee profile, optionally filtered by ticket ID |
+| `create_ticket` | Creates a new ticket after reviewing and confirming validated fields and checking for duplicates |
+| `check_system_status` *(bonus)* | Reports sample, non-live status of internal systems (VPN, Email, Wi-Fi, Printing) |
 
-An LLM call (Claude, via a forced tool call) classifies the user's intent and extracts only the information they explicitly stated. The graph then routes to the right tool node, executes it against local JSON data, and a second LLM call phrases the tool's raw result into a friendly reply. If required information is missing, the graph asks a clarifying question and remembers the answer on the next turn instead of restarting the conversation.
+An LLM call (the configured OpenRouter model, via a forced tool call) classifies the user's intent and extracts only the information they explicitly stated. The graph then routes to the right tool node, executes it against local JSON data, and deterministic templates display the tool's actual stored fields. If required information is missing, the graph asks a clarifying question and remembers the answer on the next turn instead of restarting the conversation.
 
 ## 3. Architecture Diagram
 
@@ -45,7 +44,7 @@ flowchart TD
     ROUTE -->|ticket_lookup| LOOKUP[ticket_lookup_node<br/>Tool: lookup_tickets]
     ROUTE -->|ticket_creation| CREATE[ticket_creation_node<br/>Tool: verify_employee + create_ticket]
     ROUTE -->|system_status| STATUS[system_status_node<br/>Tool: check_system_status]
-    ROUTE -->|general_chat| CHAT[general_chat_node<br/>LLM free-text reply]
+    ROUTE -->|general_chat| CHAT[general_chat_node<br/>Supported-capability help]
 
     KB --> CLAR1{needs_clarification?}
     LOOKUP --> CLAR2{needs_clarification?}
@@ -53,7 +52,7 @@ flowchart TD
     STATUS --> CLAR4{needs_clarification?}
 
     CLAR1 -->|yes: ask user| END1([END - clarifying question])
-    CLAR1 -->|no| GEN[generate_response_node<br/>LLM phrases tool result]
+    CLAR1 -->|no| GEN[generate_response_node<br/>Templates render stored facts]
     CLAR2 -->|yes| END1
     CLAR2 -->|no| GEN
     CLAR3 -->|yes| END1
@@ -71,7 +70,7 @@ flowchart TD
 
 - **Python 3.10+**
 - **LangGraph** — workflow orchestration (state graph, conditional routing)
-- **OpenRouter API** (OpenAI-compatible `chat.completions`) — intent classification (via forced tool/function-calling) and response generation; defaults to `anthropic/claude-3.5-sonnet` but any OpenRouter model slug works
+- **OpenRouter API** (OpenAI-compatible `chat.completions`) — intent classification (via forced tool/function-calling) ; defaults to `anthropic/claude-3.5-sonnet` with a tool-calling model configurable
 - **Streamlit** — chat UI
 - **Local JSON files** — employees, tickets, knowledge base, system status (no external DB needed)
 
@@ -157,7 +156,7 @@ Use the sidebar's **🔄 Reset conversation** button to clear state and start ov
 
 **Ticket creation with validation**
 > User: `My VPN is not working. Please raise a ticket.`
-> Assistant: `What's your employee ID?` → `EMP1002` → `What category best describes the issue?` → `VPN` → `Could you briefly describe the issue?` → *user describes it* →
+> Assistant: `What's your employee ID?` → `EMP1002` → `What category best describes the issue?` → `VPN` → `Could you briefly describe the issue?` → *user describes it* → *review draft* → `confirm` →
 > Assistant: `Done! Ticket TCK-1005 has been raised (VPN, priority: Medium).`
 
 **Duplicate prevention**
@@ -175,15 +174,15 @@ Use the sidebar's **🔄 Reset conversation** button to clear state and start ov
 - **The LLM never invents ticket data.** The classifier is explicitly instructed to return `null` for anything the user didn't state, and `ticket_creation_node` re-validates required fields in code (not via the LLM) before ever calling `create_ticket`.
 - **State-driven slot filling instead of giant prompts.** Rather than stuffing the whole conversation into every LLM call and hoping it remembers the employee ID, the graph tracks `awaiting_field` / `pending_intent` / `ticket_draft` explicitly in state, so `fill_slot` can resume a partially-completed ticket without even calling the LLM.
 - **Duplicate-ticket prevention lives in the tool layer**, not the prompt, so it can't be bypassed by a differently-phrased request — `create_ticket()` always checks for an existing open ticket in the same category before writing a new one.
-- **Two-stage LLM usage.** One call decides *what* to do (classification), a second call decides *how to phrase* the already-retrieved result. This keeps the "brain" (decision-making) and the "voice" (user-facing phrasing) separate and makes each easier to reason about and test independently of the other.
-- **Deterministic fallback responses.** `_fallback_response()` in `graph.py` provides a template-based answer if the phrasing LLM call fails, so a transient API error degrades the experience rather than crashing it.
+- **Grounded output.** The LLM classifies requests; templates render tool facts and supported capabilities so generated wording cannot add status claims or promise notifications.
+- **Deterministic responses.** `_fallback_response()` in `graph.py` is the standard tool-result renderer. Classifier failures return a safe retry message without writing a ticket.
 - **JSON files instead of a real database.** Keeps the project runnable anywhere with zero setup, per the assignment's "achievable on a local machine" guidance. `db.py` isolates all file I/O, so swapping in SQLite later only requires changing that one module.
 
 ## 11. Limitations
 
 - Knowledge-base search uses simple keyword-overlap scoring, not embeddings/semantic search — good enough for a small local KB, but won't scale to a large, diverse article set.
 - No authentication — employee ID is trusted based on lookup only, mirroring a low-stakes internal tool, not a production identity system.
-- `st.session_state` (single browser session) is the only persistence layer; the app doesn't yet use LangGraph's built-in checkpointer, so state won't survive a server restart or work across multiple concurrent users.
+- Conversation state is per browser session and clears on reset/restart. Tickets are saved in local JSON, survive conversation reset, and may be lost on redeployment or replacement of the filesystem. JSON writes are not safe for concurrent production writers; use a transactional database before multi-user production use.
 - Ticket priority defaults to "Medium" unless the user explicitly states urgency; the assistant does not infer priority from issue severity.
 - Intent classification quality depends on the underlying LLM; ambiguous multi-intent messages (e.g. "check my ticket and also raise a new one") are handled as a single intent per turn.
 
@@ -208,3 +207,16 @@ Streamlit Cloud exposes secrets via `st.secrets`, not real environment variables
 ## 13. Technical Skills Demonstrated
 
 Python · LangGraph (State, Nodes, Edges, Conditional Routing) · Agentic AI · Tool/Function Calling · State Management · Local JSON Data Integration · Prompt Engineering · Streamlit · Error Handling · Modular Architecture
+
+
+## Review fixes and regression checks
+
+The selected demo employee stays fixed for the session. Reset conversation to select another fictional profile. Ticket-ID lookup always requires an employee and filters ownership before returning any record. This is demo scoping, not authentication.
+
+Ticket creation collects a category and description, shows a draft, and writes only after exact `confirm`. `cancel` or `reset` discards pending work at any collection stage, including confirmation; it never cancels saved tickets. Category follow-ups accept `Printer. My printer prints blank pages.` as two fields. Allowed categories are VPN, Laptop, Email, Printer, Software, Wi-Fi, Network, Hardware, and Other. Invalid values are rejected at the storage boundary. Existing policy (one active ticket per employee/category) is preserved, rather than silently changing duplicate behavior.
+
+System status is seeded local sample data. Replies show the recorded incident date and explicitly say freshness is unknown. Status requests do not populate a ticket draft. Comments, updates, saved-ticket cancellation, appointments, and notifications are not supported.
+
+The sidebar shows OpenRouter and the configured model name, never credentials. Record the exact deployment commit when deploying; this branch does not update the public app automatically. See `docs/REVIEW_FIXES.md` for the source baseline and validation scope.
+
+Run checks with `python -m pip install -r requirements-dev.txt`, then `python -m pytest -q` and `python -m compileall -q agent app.py`.

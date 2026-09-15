@@ -26,6 +26,7 @@ class AgentState(TypedDict, total=False):
     search_query: Optional[str]
 
     # --- Conditional-routing control ---
+    creation_confirmed: bool          # transient; only exact confirm of a reviewed draft
     awaiting_field: Optional[str]      # e.g. "employee_id" | "category" | "description" -- set when the agent must ask the user something before continuing
 
     # --- Tool execution results (transient, per turn) ---

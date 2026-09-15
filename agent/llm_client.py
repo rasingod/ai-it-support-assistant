@@ -61,7 +61,7 @@ def get_client() -> OpenAI:
                 "restart the app -- editing .env while the app is already running has no "
                 "effect until it's restarted, since the key is only read once at startup."
             )
-        _client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
+        _client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key, timeout=30, max_retries=1)
     return _client
 
 
@@ -172,12 +172,17 @@ def classify_request(user_input: str, conversation_context: str = "") -> Dict[st
         for call in tool_calls:
             if call.function.name == "route_request":
                 try:
-                    return json.loads(call.function.arguments)
+                    route = json.loads(call.function.arguments)
+                    if not isinstance(route, dict) or route.get("intent") not in ROUTE_REQUEST_TOOL["function"]["parameters"]["properties"]["intent"]["enum"]:
+                        raise ValueError("Invalid route")
+                    if any(value is not None and not isinstance(value, str) for value in route.values()):
+                        raise ValueError("Invalid route field")
+                    return route
                 except (json.JSONDecodeError, TypeError):
                     break
 
     # Should not happen given forced tool_choice, but fail safe.
-    return {"intent": "general_chat"}
+    raise ValueError("No valid routing tool call returned.")
 
 
 def generate_reply(system_prompt: str, messages: List[Dict[str, str]]) -> str:

@@ -14,6 +14,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from . import db
+from .validation import canonical_category
 
 STOP_WORDS = {
     "a", "an", "the", "is", "are", "my", "i", "to", "for", "of", "on", "in",
@@ -69,18 +70,8 @@ def search_knowledge_base(query: str, top_k: int = 2) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def lookup_tickets(employee_id: Optional[str] = None, ticket_id: Optional[str] = None) -> Dict[str, Any]:
-    if not employee_id and not ticket_id:
-        return {
-            "success": False,
-            "error": "Need either an employee ID or a ticket ID to look up tickets.",
-            "results": [],
-        }
-
-    if ticket_id:
-        results = db.find_tickets(ticket_id=ticket_id)
-        if not results:
-            return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "results": []}
-        return {"success": True, "results": results}
+    if not employee_id:
+        return {"success": False, "error": "An employee ID is required for ticket lookup.", "results": []}
 
     # Employee-based lookup: employee must exist
     employee = db.find_employee(employee_id)
@@ -91,7 +82,7 @@ def lookup_tickets(employee_id: Optional[str] = None, ticket_id: Optional[str] =
             "results": [],
         }
 
-    results = db.find_tickets(employee_id=employee_id)
+    results = db.find_tickets(employee_id=employee_id, ticket_id=ticket_id)
     return {"success": True, "results": results, "employee": employee}
 
 
@@ -109,6 +100,8 @@ def validate_ticket_draft(draft: Dict[str, Any]) -> List[str]:
     for field in REQUIRED_TICKET_FIELDS:
         if not draft.get(field) or not str(draft.get(field)).strip():
             problems.append(field)
+    if draft.get("category") and not canonical_category(draft["category"]):
+        problems.append("category")
     return problems
 
 
@@ -128,6 +121,8 @@ def create_ticket(employee_id: str, category: str, description: str, priority: O
 
     if not priority or priority.strip().lower() not in VALID_PRIORITIES:
         priority = "Medium"
+
+    category = canonical_category(category)
 
     # Duplicate prevention
     existing = db.find_open_ticket_for_category(employee_id, category)

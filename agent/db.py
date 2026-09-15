@@ -12,6 +12,7 @@ SQLite later without changing any calling code.
 
 import json
 import os
+from .validation import canonical_category
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -102,12 +103,15 @@ def _next_ticket_id(tickets: List[Dict[str, Any]]) -> str:
 
 
 def create_ticket(employee_id: str, category: str, description: str, priority: str = "Medium") -> Dict[str, Any]:
+    category = canonical_category(category)
+    if not category or not description or not description.strip() or not find_employee(employee_id):
+        raise ValueError("Invalid employee, category or description.")
     tickets = get_tickets()
     now = datetime.now().isoformat(timespec="seconds")
     new_ticket = {
         "ticket_id": _next_ticket_id(tickets),
         "employee_id": employee_id.strip().upper(),
-        "category": category.strip().title(),
+        "category": category,
         "description": description.strip(),
         "priority": priority.strip().title() if priority else "Medium",
         "status": "Open",

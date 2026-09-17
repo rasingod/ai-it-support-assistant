@@ -107,16 +107,43 @@ def create_ticket(employee_id: str, category: str, description: str, priority: s
     new_ticket = {
         "ticket_id": _next_ticket_id(tickets),
         "employee_id": employee_id.strip().upper(),
-        "category": category.strip().title(),
+        # NOTE: category is expected to already be a validated, canonically-
+        # cased value from tools.normalize_category() (e.g. "VPN", "Account
+        # Access") by the time it reaches this layer -- deliberately NOT
+        # applying .title() here, since that would mangle acronyms like
+        # "VPN" into "Vpn". Only whitespace is trimmed defensively.
+        "category": category.strip(),
         "description": description.strip(),
         "priority": priority.strip().title() if priority else "Medium",
         "status": "Open",
+        "escalated": False,
         "created_at": now,
         "updated_at": now,
     }
     tickets.append(new_ticket)
     _write_json(TICKETS_FILE, tickets)
     return new_ticket
+
+
+def escalate_ticket(ticket_id: str, reason: str) -> Optional[Dict[str, Any]]:
+    """Marks a ticket escalated: bumps priority to High and records the
+    reason + timestamp. Returns the updated ticket, or None if not found
+    (callers are expected to have already checked existence via find_tickets)."""
+    tickets = get_tickets()
+    now = datetime.now().isoformat(timespec="seconds")
+    updated_ticket = None
+    for t in tickets:
+        if t["ticket_id"].upper() == ticket_id.strip().upper():
+            t["escalated"] = True
+            t["escalation_reason"] = reason.strip()
+            t["priority"] = "High"
+            t["escalated_at"] = now
+            t["updated_at"] = now
+            updated_ticket = t
+            break
+    if updated_ticket is not None:
+        _write_json(TICKETS_FILE, tickets)
+    return updated_ticket
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,80 @@ def _tokenize(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Shared: category normalization
+# ---------------------------------------------------------------------------
+# Constraining category to a known list (rather than storing whatever raw
+# text the user typed) fixes two related problems: a free-form reply that
+# crams in extra detail no longer gets stored verbatim as the "category"
+# (which broke duplicate-detection, since two tickets about the same VPN
+# issue could end up with different literal category strings), and every
+# displayed/stored category value is guaranteed to be one of a small,
+# predictable set.
+
+ALLOWED_CATEGORIES = [
+    "VPN", "Laptop", "Email", "Printer", "Software", "Internet",
+    "Mobile", "Account Access", "Hardware", "Network",
+]
+_CATEGORY_ALIASES = {
+    "wifi": "Network", "wi-fi": "Network", "wi fi": "Network",
+    "phone": "Mobile", "cell phone": "Mobile", "cellphone": "Mobile",
+    "pc": "Laptop", "computer": "Laptop", "desktop": "Laptop", "notebook": "Laptop",
+    "outlook": "Email", "mail": "Email", "e-mail": "Email",
+    "app": "Software", "application": "Software", "program": "Software",
+    "mfa": "Account Access", "2fa": "Account Access", "login": "Account Access",
+    "password": "Account Access",
+}
+
+
+def normalize_category(raw_text: str) -> Dict[str, Optional[str]]:
+    """Extracts a known category from free-form text instead of storing the
+    raw text verbatim. Returns {"category": <one of ALLOWED_CATEGORIES or
+    "Other">, "leftover": <remaining text that looks like a description, or
+    None>}.
+
+    This lets a combined reply like "Printer, my printer prints blank pages"
+    (answering a single "what category?" question) split cleanly into a
+    valid category plus a separate description, instead of the entire
+    sentence becoming the category.
+    """
+    if not raw_text or not raw_text.strip():
+        return {"category": "Other", "leftover": None}
+
+    text = raw_text.strip()
+    text_lower = text.lower()
+    token_set = set(_tokenize(text))
+
+    matched = None
+    matched_phrase = None
+    for cat in ALLOWED_CATEGORIES:
+        cat_tokens = set(_tokenize(cat))
+        if cat_tokens and cat_tokens.issubset(token_set):
+            matched = cat
+            matched_phrase = cat
+            break
+    if not matched:
+        for alias, cat in _CATEGORY_ALIASES.items():
+            if alias in text_lower:
+                matched = cat
+                matched_phrase = alias
+                break
+
+    if not matched:
+        # Couldn't confidently identify a known category -- use the safe
+        # generic bucket rather than storing arbitrary free text as the
+        # category, but keep the user's own words as the description so
+        # nothing they said is silently discarded.
+        return {"category": "Other", "leftover": text}
+
+    leftover = re.sub(re.escape(matched_phrase), "", text, count=1, flags=re.IGNORECASE).strip(" ,.-:;")
+    leftover = re.sub(r"\s+", " ", leftover).strip()  # collapse any double-space left by the removal
+    if len(leftover) < 4:  # not enough left over to be a meaningful description
+        leftover = None
+
+    return {"category": matched, "leftover": leftover}
+
+
+# ---------------------------------------------------------------------------
 # Tool 1: Knowledge Search
 # ---------------------------------------------------------------------------
 
@@ -80,6 +154,15 @@ def lookup_tickets(employee_id: Optional[str] = None, ticket_id: Optional[str] =
         results = db.find_tickets(ticket_id=ticket_id)
         if not results:
             return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "results": []}
+
+        # Ownership check: if we know which employee is asking, the ticket
+        # must belong to them. Return the SAME "not found" message either
+        # way (don't first reveal the ticket exists/belongs to someone else
+        # and only then warn -- that's disclosure regardless of the wording
+        # attached to it).
+        if employee_id and results[0]["employee_id"].upper() != employee_id.strip().upper():
+            return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "results": []}
+
         return {"success": True, "results": results}
 
     # Employee-based lookup: employee must exist
@@ -126,6 +209,12 @@ def create_ticket(employee_id: str, category: str, description: str, priority: O
     if not employee:
         return {"success": False, "error": f"Cannot create ticket: unknown employee ID '{employee_id}'.", "ticket": None}
 
+    # Constrain category to the known set here too, not just in the graph's
+    # slot-filling step -- this function is the single point every ticket
+    # write goes through, so it's the most reliable place to guarantee a
+    # consistent, validated category regardless of how it was captured.
+    category = normalize_category(category)["category"]
+
     if not priority or priority.strip().lower() not in VALID_PRIORITIES:
         priority = "Medium"
 
@@ -158,8 +247,68 @@ def verify_employee(employee_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool 4: Ticket Escalation
+# ---------------------------------------------------------------------------
+
+NON_ESCALATABLE_STATUSES = {"resolved", "closed"}
+
+
+def escalate_ticket(ticket_id: str, reason: str, requesting_employee_id: Optional[str] = None) -> Dict[str, Any]:
+    """Escalates an existing ticket: bumps priority to High and records why.
+
+    Guardrails (mirroring create_ticket's validation style):
+      - Ticket must exist -- never invents one.
+      - If a requesting employee ID is given, the ticket must belong to them
+        (an employee shouldn't be able to escalate someone else's ticket).
+      - A resolved/closed ticket can't be escalated.
+      - Escalating an already-escalated ticket is a no-op, not a duplicate
+        action -- mirrors create_ticket's duplicate-prevention pattern.
+    """
+    if not ticket_id or not str(ticket_id).strip():
+        return {"success": False, "error": "Missing ticket ID to escalate.", "ticket": None}
+    if not reason or not str(reason).strip():
+        return {"success": False, "error": "Missing a reason for the escalation.", "ticket": None}
+
+    matches = db.find_tickets(ticket_id=ticket_id)
+    if not matches:
+        return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "ticket": None}
+    ticket = matches[0]
+
+    if requesting_employee_id and ticket["employee_id"].upper() != requesting_employee_id.strip().upper():
+        return {
+            "success": False,
+            "error": f"Ticket {ticket['ticket_id']} doesn't belong to employee '{requesting_employee_id}', so it can't be escalated from here.",
+            "ticket": None,
+        }
+
+    if ticket.get("status", "").lower() in NON_ESCALATABLE_STATUSES:
+        return {
+            "success": False,
+            "error": f"Ticket {ticket['ticket_id']} is already {ticket['status']} and can't be escalated.",
+            "ticket": ticket,
+        }
+
+    if ticket.get("escalated"):
+        return {
+            "success": True,
+            "already_escalated": True,
+            "ticket": ticket,
+            "message": f"Ticket {ticket['ticket_id']} was already escalated on {ticket.get('escalated_at', 'an earlier date')}.",
+        }
+
+    updated = db.escalate_ticket(ticket_id, reason)
+    return {"success": True, "already_escalated": False, "ticket": updated}
+
+
+# ---------------------------------------------------------------------------
 # Bonus tool: System status
 # ---------------------------------------------------------------------------
+
+_STATUS_FRESHNESS_NOTE = (
+    "This reflects the last recorded status update in the system-status "
+    "data source, not a live real-time check performed just now."
+)
+
 
 def check_system_status(system_name: Optional[str] = None) -> Dict[str, Any]:
     statuses = db.get_system_status()
@@ -171,5 +320,5 @@ def check_system_status(system_name: Optional[str] = None) -> Dict[str, Any]:
         ]
         if not matches:
             return {"success": False, "error": f"No status information for '{system_name}'.", "results": []}
-        return {"success": True, "results": matches}
-    return {"success": True, "results": statuses}
+        return {"success": True, "results": matches, "note": _STATUS_FRESHNESS_NOTE}
+    return {"success": True, "results": statuses, "note": _STATUS_FRESHNESS_NOTE}

@@ -128,6 +128,7 @@ with st.sidebar:
     st.code("How do I reset my VPN password?", language=None)
     st.code("What's the status of my laptop issue? EMP1024", language=None)
     st.code("My VPN is not working, please raise a ticket.", language=None)
+    st.code("Escalate ticket TCK-1001, it's been unresolved too long.", language=None)
     st.code("Is email down right now?", language=None)
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,12 @@ LangGraph workflow definition for the AI IT Support Assistant.
   classify_intent                                        |
       |                                                 |
       +----------------- route_by_intent <---------------+
-      |            |            |            |
-      v            v            v            v
-  knowledge_   ticket_      ticket_       general_chat
-  search       lookup       creation           |
-      |            |            |              v
-      +----- needs_clarification? -----+      END
+      |            |            |            |            |
+      v            v            v            v            v
+  knowledge_   ticket_      ticket_      escalation   general_chat
+  search       lookup       creation                       |
+      |            |            |            |              v
+      +----- needs_clarification? -----------+             END
       |                       |
       v                       v
   generate_response          END  (a clarifying question was already set)
@@ -37,7 +37,7 @@ from langgraph.graph import END, StateGraph
 from . import llm_client, tools
 from .state import AgentState
 
-VALID_INTENTS = {"knowledge_search", "ticket_lookup", "ticket_creation", "system_status", "general_chat"}
+VALID_INTENTS = {"knowledge_search", "ticket_lookup", "ticket_creation", "escalation", "system_status", "general_chat"}
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +70,38 @@ def entry_router(state: AgentState) -> Dict[str, Any]:
     return {}
 
 
+CANCEL_PHRASES = {
+    "cancel", "stop", "nevermind", "never mind", "quit", "abort",
+    "forget it", "forget about it", "cancel that", "cancel it", "no thanks",
+}
+
+
 def fill_slot(state: AgentState) -> Dict[str, Any]:
     """Consumes the user's answer to a previously-asked clarifying
     question and stores it in the right place, WITHOUT calling the LLM.
     This directly demonstrates state retention across conversation turns."""
     field = state.get("awaiting_field")
     value = state["user_input"].strip()
-    ticket_draft = dict(state.get("ticket_draft", {}))
 
+    # Recognize a cancellation BEFORE treating the reply as a field value --
+    # otherwise "cancel" itself gets stored as the literal category/ticket
+    # ID/etc. Clears the whole in-progress draft rather than just the one
+    # field, since an abandoned request shouldn't leave partial state behind
+    # for a later, unrelated message to accidentally pick up.
+    if value.lower().strip(" .!") in CANCEL_PHRASES:
+        return {
+            "awaiting_field": None,
+            "pending_intent": None,
+            "intent": "cancelled",
+            "ticket_draft": {},
+            "ticket_id": None,
+            "escalation_reason": None,
+            "tool_name": None,
+            "tool_result": None,
+            "final_response": "No problem — I've cancelled that request. Let me know if there's anything else I can help with.",
+        }
+
+    ticket_draft = dict(state.get("ticket_draft", {}))
     update: Dict[str, Any] = {"awaiting_field": None, "intent": state.get("pending_intent")}
 
     if field == "employee_id":
@@ -86,7 +110,19 @@ def fill_slot(state: AgentState) -> Dict[str, Any]:
         update["ticket_id"] = value
     elif field == "search_query":
         update["search_query"] = value
-    elif field in ("category", "description", "priority"):
+    elif field == "escalation_reason":
+        update["escalation_reason"] = value
+    elif field == "category":
+        # Constrain to a known category instead of storing the raw reply
+        # verbatim -- also recovers a description if the user answered
+        # "what category?" with both a category and extra detail in one
+        # sentence (e.g. "Printer, it's printing blank pages").
+        norm = tools.normalize_category(value)
+        ticket_draft["category"] = norm["category"]
+        if norm["leftover"] and not ticket_draft.get("description"):
+            ticket_draft["description"] = norm["leftover"]
+        update["ticket_draft"] = ticket_draft
+    elif field in ("description", "priority"):
         ticket_draft[field] = value
         update["ticket_draft"] = ticket_draft
     else:
@@ -121,9 +157,10 @@ def classify_intent(state: AgentState) -> Dict[str, Any]:
     # the user doesn't have to repeat it), ticket_id must NOT persist across
     # turns. Otherwise a ticket mentioned earlier in the conversation would
     # silently narrow a later "list my tickets" down to just that one ticket
-    # instead of showing all of them. So for ticket_lookup we always sync
-    # ticket_id to exactly what (if anything) was mentioned THIS turn.
-    if intent == "ticket_lookup":
+    # instead of showing all of them. Same reasoning applies to escalation:
+    # each escalation request should target exactly the ticket mentioned
+    # THIS turn (or none, prompting a fresh ask), never a stale one.
+    if intent in ("ticket_lookup", "escalation"):
         update["ticket_id"] = route.get("ticket_id") or None
     elif route.get("ticket_id"):
         update["ticket_id"] = route["ticket_id"]
@@ -133,15 +170,30 @@ def classify_intent(state: AgentState) -> Dict[str, Any]:
     elif intent == "knowledge_search":
         update["search_query"] = state["user_input"]
 
-    ticket_draft = dict(state.get("ticket_draft", {}))
-    if route.get("category"):
-        ticket_draft["category"] = route["category"]
-    if route.get("description"):
-        ticket_draft["description"] = route["description"]
-    if route.get("priority"):
-        ticket_draft["priority"] = route["priority"]
-    if ticket_draft:
-        update["ticket_draft"] = ticket_draft
+    if intent == "escalation":
+        update["escalation_reason"] = route.get("escalation_reason") or None
+    elif route.get("escalation_reason"):
+        update["escalation_reason"] = route["escalation_reason"]
+
+    # Only populate/mutate the ticket draft when the CURRENT intent is
+    # actually ticket_creation. Without this gate, an unrelated question
+    # (e.g. a system-status check) could leave a stray category/description
+    # sitting in ticket_draft -- visible in the UI and liable to leak into a
+    # later, genuinely unrelated ticket-creation flow -- if the classifier
+    # ever populates those optional fields for a different intent.
+    if intent == "ticket_creation":
+        ticket_draft = dict(state.get("ticket_draft", {}))
+        if route.get("category"):
+            norm = tools.normalize_category(route["category"])
+            ticket_draft["category"] = norm["category"]
+            if norm["leftover"] and not route.get("description") and not ticket_draft.get("description"):
+                ticket_draft["description"] = norm["leftover"]
+        if route.get("description"):
+            ticket_draft["description"] = route["description"]
+        if route.get("priority"):
+            ticket_draft["priority"] = route["priority"]
+        if ticket_draft:
+            update["ticket_draft"] = ticket_draft
 
     return update
 
@@ -242,6 +294,61 @@ def ticket_creation_node(state: AgentState) -> Dict[str, Any]:
     return update
 
 
+def escalate_ticket_node(state: AgentState) -> Dict[str, Any]:
+    """Escalation flow mirrors ticket_creation_node's step-by-step slot
+    filling: confirm who's asking, which ticket, and why -- in that order --
+    before ever touching the data layer."""
+    employee_id = state.get("employee_id")
+
+    # Step 1: employee ID (needed to confirm ticket ownership below)
+    if not employee_id:
+        return _ask(
+            state,
+            "Sure -- what's your employee ID? I'll use it to confirm the ticket is yours before escalating.",
+            "employee_id",
+            "escalation",
+        )
+
+    if not state.get("employee_verified"):
+        verify = tools.verify_employee(employee_id)
+        if not verify["success"]:
+            return _ask(
+                state,
+                f"I couldn't find employee ID '{employee_id}'. Could you re-check and re-enter it?",
+                "employee_id",
+                "escalation",
+            )
+
+    # Step 2: which ticket
+    ticket_id = state.get("ticket_id")
+    if not ticket_id:
+        return _ask(state, "Which ticket would you like to escalate? Please share the ticket ID.", "ticket_id", "escalation")
+
+    # Step 3: why
+    reason = state.get("escalation_reason")
+    if not reason:
+        return _ask(
+            state,
+            "What's the reason for escalating this ticket? (e.g. unresolved for too long, urgent business impact)",
+            "escalation_reason",
+            "escalation",
+        )
+
+    result = tools.escalate_ticket(ticket_id=ticket_id, reason=reason, requesting_employee_id=employee_id)
+
+    update: Dict[str, Any] = {
+        "tool_name": "escalate_ticket",
+        "tool_result": result,
+        "employee_verified": True,
+    }
+    if result.get("success"):
+        # Clear so a later, unrelated message doesn't accidentally reuse
+        # this ticket/reason (same rationale as ticket_draft after creation).
+        update["ticket_id"] = None
+        update["escalation_reason"] = None
+    return update
+
+
 def system_status_node(state: AgentState) -> Dict[str, Any]:
     system_name = state.get("search_query") or state.get("user_input")
     result = tools.check_system_status(system_name)
@@ -252,8 +359,16 @@ def general_chat_node(state: AgentState) -> Dict[str, Any]:
     system_prompt = (
         "You are a friendly, concise IT Support Assistant for a fictional company. "
         "The user's message is not a specific IT request (e.g. it's a greeting or "
-        "thanks). Reply briefly and, if relevant, mention you can help with "
-        "knowledge-base questions, ticket status checks, or raising new tickets."
+        "thanks). Reply briefly. You may offer to help with exactly these things, "
+        "and nothing else, because these are the only tools that actually exist: "
+        "(1) search IT help articles, (2) check the status of an existing ticket, "
+        "(3) raise a new ticket, (4) escalate an existing ticket, (5) check system "
+        "status (VPN/Email/Wi-Fi/Printing). Never offer, promise, or imply any "
+        "other action -- e.g. editing/updating a ticket's details, sending "
+        "notifications, scheduling a callback, or cancelling an appointment -- "
+        "since no tool exists for those. Also never ask the user to 'confirm' an "
+        "action; ticket creation and escalation happen immediately once the "
+        "required details are collected, so there is no separate confirmation step."
     )
     try:
         reply = llm_client.generate_reply(system_prompt, [{"role": "user", "content": state["user_input"]}])
@@ -275,9 +390,22 @@ def generate_response_node(state: AgentState) -> Dict[str, Any]:
         "that was just executed and its JSON result. Write a short, clear, "
         "friendly response to the user based ONLY on that JSON data. "
         "Do not invent any information (ticket IDs, statuses, article steps, "
-        "employee names, etc.) that is not present in the JSON. "
+        "employee names, etc.) that is not present in the JSON. Do not add "
+        "reassurances, caveats, or claims (e.g. 'other systems should be "
+        "unaffected') that are not explicitly present in the JSON, even if they "
+        "seem like a reasonable inference. If the JSON includes a 'note' field, "
+        "convey it plainly rather than rephrasing away its meaning -- it often "
+        "clarifies things like data freshness. "
         "If the JSON indicates an error or empty results, say so plainly and, "
-        "for ticket creation, never claim a ticket was created if it wasn't."
+        "for ticket creation, never claim a ticket was created if it wasn't. "
+        "The only tools that exist are: search IT help articles, look up ticket "
+        "status, create a ticket, escalate a ticket, and check system status -- "
+        "never offer, promise, or imply any other action (updating a ticket's "
+        "details, sending notifications, scheduling a callback, cancelling an "
+        "appointment, etc.). Also never ask the user to 'confirm' something that "
+        "this tool result shows has already happened -- ticket creation and "
+        "escalation are immediate, one-step actions with no separate "
+        "confirmation stage."
     )
 
     user_message = (
@@ -324,10 +452,20 @@ def _fallback_response(tool_name: str, result: Dict[str, Any]) -> str:
             return f"Done! Ticket {ticket['ticket_id']} has been raised ({ticket['category']}, priority: {ticket['priority']})."
         return "Sorry, I wasn't able to create the ticket."
 
+    if tool_name == "escalate_ticket":
+        ticket = result.get("ticket")
+        if result.get("already_escalated"):
+            return result.get("message", "This ticket was already escalated.")
+        if ticket:
+            return f"Ticket {ticket['ticket_id']} has been escalated and its priority raised to {ticket['priority']}."
+        return "Sorry, I wasn't able to escalate that ticket."
+
     if tool_name == "check_system_status":
         rows = result.get("results", [])
         lines = [f"- {r['system']}: {r['status']} ({r['notes']})" for r in rows]
-        return "Current system status:\n" + "\n".join(lines)
+        note = result.get("note")
+        text = "Current system status:\n" + "\n".join(lines)
+        return text + (f"\n\n({note})" if note else "")
 
     return "Done."
 
@@ -346,6 +484,7 @@ def route_by_intent(state: AgentState) -> str:
         "knowledge_search": "knowledge_search",
         "ticket_lookup": "ticket_lookup",
         "ticket_creation": "ticket_creation",
+        "escalation": "escalation",
         "system_status": "system_status",
         "general_chat": "general_chat",
     }.get(intent, "general_chat")
@@ -353,6 +492,17 @@ def route_by_intent(state: AgentState) -> str:
 
 def needs_clarification(state: AgentState) -> str:
     return END if state.get("awaiting_field") else "generate_response"
+
+
+def route_after_fill_slot(state: AgentState) -> str:
+    """Like route_by_intent, but first checks for the 'cancelled' sentinel
+    fill_slot sets when the user's reply was a cancellation rather than an
+    answer to the pending question -- in that case final_response is
+    already set, so this routes straight to END instead of running a tool
+    node (which would try to act on the now-cleared draft)."""
+    if state.get("intent") == "cancelled":
+        return END
+    return route_by_intent(state)
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +518,7 @@ def build_graph():
     graph.add_node("knowledge_search", knowledge_search_node)
     graph.add_node("ticket_lookup", ticket_lookup_node)
     graph.add_node("ticket_creation", ticket_creation_node)
+    graph.add_node("escalation", escalate_ticket_node)
     graph.add_node("system_status", system_status_node)
     graph.add_node("general_chat", general_chat_node)
     graph.add_node("generate_response", generate_response_node)
@@ -387,6 +538,7 @@ def build_graph():
             "knowledge_search": "knowledge_search",
             "ticket_lookup": "ticket_lookup",
             "ticket_creation": "ticket_creation",
+            "escalation": "escalation",
             "system_status": "system_status",
             "general_chat": "general_chat",
         },
@@ -394,17 +546,19 @@ def build_graph():
 
     graph.add_conditional_edges(
         "fill_slot",
-        route_by_intent,
+        route_after_fill_slot,
         {
             "knowledge_search": "knowledge_search",
             "ticket_lookup": "ticket_lookup",
             "ticket_creation": "ticket_creation",
+            "escalation": "escalation",
             "system_status": "system_status",
             "general_chat": "general_chat",
+            END: END,
         },
     )
 
-    for tool_node in ("knowledge_search", "ticket_lookup", "ticket_creation", "system_status"):
+    for tool_node in ("knowledge_search", "ticket_lookup", "ticket_creation", "escalation", "system_status"):
         graph.add_conditional_edges(
             tool_node,
             needs_clarification,

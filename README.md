@@ -1,7 +1,6 @@
 # AI IT Support Assistant
 
 Live demo: https://ai-it-support-assistant-demo.streamlit.app/
-
 An agentic AI IT-support chatbot built with **LangGraph**, **LLM Function**, and **Streamlit**. It understands an employee's request, decides which tool it needs, executes that tool against local sample data, and returns a clear, grounded response — while holding onto context (like an employee ID) across multiple turns of conversation.
 
 ---
@@ -18,13 +17,14 @@ Employees at a fictional organization ("FictionalCorp") raise repetitive IT requ
 
 ## 2. Solution Overview
 
-The assistant is built as a **LangGraph** state machine with four capabilities exposed as tools. LLM calls are routed through **OpenRouter** (an OpenAI-compatible API that can serve Claude, GPT, Llama, and other models through a single key), so the project only needs one `OPENROUTER_API_KEY` regardless of which underlying model you pick.
+The assistant is built as a **LangGraph** state machine with five capabilities exposed as tools. LLM calls are routed through **OpenRouter** (an OpenAI-compatible API that can serve Claude, GPT, Llama, and other models through a single key), so the project only needs one `OPENROUTER_API_KEY` regardless of which underlying model you pick.
 
 | Tool | Purpose |
 |---|---|
 | `search_knowledge_base` | Searches a local IT knowledge base for how-to articles |
 | `lookup_tickets` | Looks up existing tickets within the selected employee profile, optionally filtered by ticket ID |
 | `create_ticket` | Creates a new ticket after reviewing and confirming validated fields and checking for duplicates |
+| `escalate_ticket` | Raises an owned active ticket to High priority after collecting a reason; repeated escalation is a no-op |
 | `check_system_status` *(bonus)* | Reports sample, non-live status of internal systems (VPN, Email, Wi-Fi, Printing) |
 
 An LLM call (the configured OpenRouter model, via a forced tool call) classifies the user's intent and extracts only the information they explicitly stated. The graph then routes to the right tool node, executes it against local JSON data, and deterministic templates display the tool's actual stored fields. If required information is missing, the graph asks a clarifying question and remembers the answer on the next turn instead of restarting the conversation.
@@ -43,12 +43,14 @@ flowchart TD
     ROUTE -->|knowledge_search| KB[knowledge_search_node<br/>Tool: search_knowledge_base]
     ROUTE -->|ticket_lookup| LOOKUP[ticket_lookup_node<br/>Tool: lookup_tickets]
     ROUTE -->|ticket_creation| CREATE[ticket_creation_node<br/>Tool: verify_employee + create_ticket]
+    ROUTE -->|escalation| ESCALATE[escalate_ticket_node<br/>Tool: verify_employee + escalate_ticket]
     ROUTE -->|system_status| STATUS[system_status_node<br/>Tool: check_system_status]
     ROUTE -->|general_chat| CHAT[general_chat_node<br/>Supported-capability help]
 
     KB --> CLAR1{needs_clarification?}
     LOOKUP --> CLAR2{needs_clarification?}
     CREATE --> CLAR3{needs_clarification?}
+    ESCALATE --> CLAR5{needs_clarification?}
     STATUS --> CLAR4{needs_clarification?}
 
     CLAR1 -->|yes: ask user| END1([END - clarifying question])
@@ -57,6 +59,8 @@ flowchart TD
     CLAR2 -->|no| GEN
     CLAR3 -->|yes| END1
     CLAR3 -->|no| GEN
+    CLAR5 -->|yes| END1
+    CLAR5 -->|no| GEN
     CLAR4 -->|yes| END1
     CLAR4 -->|no| GEN
 
@@ -83,7 +87,7 @@ ai-it-support-assistant/
 │   ├── __init__.py
 │   ├── state.py                # AgentState TypedDict (shared graph state)
 │   ├── graph.py                 # LangGraph nodes, conditional edges, graph assembly
-│   ├── tools.py                 # The 3 required tools + verify_employee + bonus status tool
+│   ├── tools.py                 # The 3 required tools + escalation + verify_employee + bonus status tool
 │   ├── llm_client.py            # OpenRouter API wrapper (tool-forced classification + text generation)
 │   └── db.py                    # Local JSON data access layer
 ├── data/
@@ -163,9 +167,21 @@ Use the sidebar's **🔄 Reset conversation** button to clear state and start ov
 > User (as EMP1024, already has an open "Laptop" ticket): `My laptop is still overheating, raise another ticket.`
 > Assistant: `An open ticket (TCK-1001) already exists for 'Laptop'. I haven't created a duplicate — would you like me to check its status instead?`
 
+**Ticket escalation (multi-turn, with ownership check)**
+> User: `Escalate it`
+> Assistant: `Which ticket would you like to escalate? Please share the ticket ID.` → `TCK-1001` → `What's the reason for escalating this ticket?` → `Unresolved for too long` →
+> Assistant: `Ticket TCK-1001 has been escalated and its priority raised to High.`
+> *(If the ticket belongs to a different employee ID, or is already Resolved/Closed, or was already escalated, the assistant explains why instead of acting.)*
+
 **Unknown employee ID (graceful validation)**
 > User: `What's the status of my ticket? My ID is EMP9999.`
 > Assistant: `I couldn't find an employee with ID 'EMP9999'. Could you double-check your employee ID?`
+
+**Cancelling a partially-completed request**
+> User: `Please raise a ticket. My employee ID is EMP1024.`
+> Assistant: `What category best describes the issue?`
+> User: `cancel`
+> Assistant: `No problem — I've cancelled that request. Let me know if there's anything else I can help with.` *(the draft is fully cleared, not left half-filled)*
 
 ## 10. Key Design Decisions
 
@@ -185,6 +201,8 @@ Use the sidebar's **🔄 Reset conversation** button to clear state and start ov
 - Conversation state is per browser session and clears on reset/restart. Tickets are saved in local JSON, survive conversation reset, and may be lost on redeployment or replacement of the filesystem. JSON writes are not safe for concurrent production writers; use a transactional database before multi-user production use.
 - Ticket priority defaults to "Medium" unless the user explicitly states urgency; the assistant does not infer priority from issue severity.
 - Intent classification quality depends on the underlying LLM; ambiguous multi-intent messages (e.g. "check my ticket and also raise a new one") are handled as a single intent per turn.
+- `fill_slot` (used to answer a clarifying question) takes the reply as a single literal value for whatever one field was asked about, without an LLM call. If a reply crams in extra information (e.g. answering "which ticket?" with "TCK-1001, and it's urgent") only the ticket ID is captured as typed — the assistant will still ask the follow-up question for anything not captured, rather than silently dropping it, but it won't parse multiple fields out of one free-form sentence during slot-filling. Answering one question at a time avoids this.
+- Escalation only raises priority to High; there's no separate escalation queue, notification, or human hand-off simulated.
 
 ## 12. Deploying for Free (Shareable Link)
 
@@ -213,10 +231,12 @@ Python · LangGraph (State, Nodes, Edges, Conditional Routing) · Agentic AI · 
 
 The selected demo employee stays fixed for the session. Reset conversation to select another fictional profile. Ticket-ID lookup always requires an employee and filters ownership before returning any record. This is demo scoping, not authentication.
 
-Ticket creation collects a category and description, shows a draft, and writes only after exact `confirm`. `cancel` or `reset` discards pending work at any collection stage, including confirmation; it never cancels saved tickets. Category follow-ups accept `Printer. My printer prints blank pages.` as two fields. Allowed categories are VPN, Laptop, Email, Printer, Software, Wi-Fi, Network, Hardware, and Other. Invalid values are rejected at the storage boundary. Existing policy (one active ticket per employee/category) is preserved, rather than silently changing duplicate behavior.
+Ticket creation collects a category and description, shows a draft, and writes only after exact `confirm`. `cancel` or `reset` discards pending work at any collection stage, including confirmation; it never cancels saved tickets. Category follow-ups accept `Printer. My printer prints blank pages.` or `Printer, my printer prints blank pages` as two fields. Category aliases such as phone, outlook, login, and computer are supported; unknown values require clarification. Allowed categories are VPN, Laptop, Email, Printer, Software, Internet, Mobile, Account Access, Wi-Fi, Network, Hardware, and Other. Invalid values are rejected at the storage boundary. Existing policy (one active ticket per employee/category) is preserved, rather than silently changing duplicate behavior.
 
-System status is seeded local sample data. Replies show the recorded incident date and explicitly say freshness is unknown. Status requests do not populate a ticket draft. Comments, updates, saved-ticket cancellation, appointments, and notifications are not supported.
+System status is seeded local sample data. Replies show the recorded incident date and explicitly say freshness is unknown. Status requests do not populate a ticket draft. Comments, editing ticket details, saved-ticket cancellation, appointments, and notifications are not supported.
 
 The sidebar shows OpenRouter and the configured model name, never credentials. Record the exact deployment commit when deploying; this branch does not update the public app automatically. See `docs/REVIEW_FIXES.md` for the source baseline and validation scope.
 
 Run checks with `python -m pip install -r requirements-dev.txt`, then `python -m pytest -q` and `python -m compileall -q agent app.py`.
+
+Escalation requires a valid selected employee, an owned ticket, and a reason. Resolved/closed tickets are rejected; an already escalated ticket is unchanged. Once these fields are collected, escalation immediately raises priority to High and records the reason/time. It does not notify anyone or create a human hand-off. Common cancellation phrases such as `never mind`, `stop`, and `no thanks` discard any pending flow.

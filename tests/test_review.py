@@ -4,6 +4,77 @@ import pytest
 from agent import db, tools, graph, llm_client
 from agent.state import new_state
 
+
+def test_escalation_collects_fields_and_is_idempotent(session):
+    before = db.get_tickets()
+    s = session("escalate a ticket", {"intent": "escalation"})
+    assert s["awaiting_field"] == "employee_id"
+    assert session("EMP1024")["awaiting_field"] == "ticket_id"
+    assert session("TCK-1001")["awaiting_field"] == "escalation_reason"
+    assert db.get_tickets() == before
+    s = session("Blocking customer calls")
+    ticket = s["tool_result"]["ticket"]
+    assert ticket["priority"] == "High" and ticket["escalated"]
+    assert ticket["escalation_reason"] == "Blocking customer calls"
+    assert s["ticket_id"] is None and s["escalation_reason"] is None
+    assert s["pending_intent"] is None and s["awaiting_field"] is None
+    after = db.get_tickets()
+    s = session("Escalate TCK-1001 again", {"intent": "escalation", "ticket_id": "TCK-1001", "escalation_reason": "Again"})
+    assert s["tool_result"]["already_escalated"]
+    assert db.get_tickets() == after
+    assert session("escalate another", {"intent": "escalation"})["awaiting_field"] == "ticket_id"
+
+
+def test_escalation_scope_and_terminal_status(session):
+    before = db.get_tickets()
+    assert not tools.escalate_ticket("TCK-1001", "Urgent")["success"]
+    other = tools.escalate_ticket("TCK-1003", "Urgent", "EMP1024")
+    absent = tools.escalate_ticket("TCK-9999", "Urgent", "EMP1024")
+    assert not other["success"] and not absent["success"]
+    assert other["ticket"] is None and "No ticket found" in other["error"]
+    assert not tools.escalate_ticket("TCK-1002", "Urgent", "EMP1002")["success"]
+    assert not tools.escalate_ticket("TCK-1001", "  ", "EMP1024")["success"]
+    assert db.get_tickets() == before
+    s = session("escalate TCK-1003 EMP1024", {"intent": "escalation", "ticket_id": "TCK-1003", "escalation_reason": "Urgent"})
+    assert s["tool_result"]["ticket"] is None
+    assert db.get_tickets() == before
+
+
+@pytest.mark.parametrize("phrase", ["never mind", "stop!", "no thanks", "cancel that", "reset"])
+def test_cancel_escalation_clears_pending_fields(session, phrase):
+    before = db.get_tickets()
+    s = session("escalate TCK-1001 EMP1024", {"intent": "escalation", "ticket_id": "TCK-1001"})
+    assert s["awaiting_field"] == "escalation_reason"
+    s = session(phrase)
+    assert s["awaiting_field"] is None and s["pending_intent"] is None
+    assert s["ticket_id"] is None and s["escalation_reason"] is None
+    assert db.get_tickets() == before
+
+
+@pytest.mark.parametrize("answer,category,description", [
+    ("Printer, my printer prints blank pages.", "Printer", "my printer prints blank pages."),
+    ("phone: battery won't charge", "Mobile", "battery won't charge"),
+    ("login; cannot sign in", "Account Access", "cannot sign in"),
+    ("Internet. Connection drops.", "Internet", "Connection drops."),
+])
+def test_expanded_category_confirmation(session, answer, category, description):
+    before = len(db.get_tickets())
+    session("new ticket EMP1024", {"intent": "ticket_creation"})
+    s = session(answer)
+    assert s["awaiting_field"] == "confirmation"
+    assert s["ticket_draft"]["category"] == category
+    assert s["ticket_draft"]["description"] == description
+    assert len(db.get_tickets()) == before
+    s = session("confirm")
+    assert s["tool_result"]["ticket"]["category"] == category
+    assert len(db.get_tickets()) == before + 1
+
+
+def test_category_alias_word_boundaries():
+    assert tools.normalize_category("happening") ["category"] is None
+    assert tools.normalize_category("cell phone, no signal")["category"] == "Mobile"
+    assert tools.normalize_category("wifi")["category"] == "Wi-Fi"
+
 @pytest.fixture
 def session(tmp_path, monkeypatch):
     target = tmp_path / "tickets.json"
@@ -149,4 +220,3 @@ def test_streamlit_creation_reset_and_lookup(session, monkeypatch):
     assert app.session_state.agent_state["employee_id"] is None
     assert app.session_state.agent_state["messages"] == []
     assert tools.lookup_tickets("EMP1024", ticket_id)["results"]
-

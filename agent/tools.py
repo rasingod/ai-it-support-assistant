@@ -14,7 +14,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from . import db
-from .validation import canonical_category
+from .validation import CATEGORIES, canonical_category, category_answer
 
 STOP_WORDS = {
     "a", "an", "the", "is", "are", "my", "i", "to", "for", "of", "on", "in",
@@ -26,6 +26,26 @@ STOP_WORDS = {
 def _tokenize(text: str) -> List[str]:
     words = re.findall(r"[a-zA-Z0-9]+", text.lower())
     return [w for w in words if w not in STOP_WORDS]
+
+
+# ---------------------------------------------------------------------------
+# Shared: category normalization
+# ---------------------------------------------------------------------------
+# Constraining category to a known list (rather than storing whatever raw
+# text the user typed) fixes two related problems: a free-form reply that
+# crams in extra detail no longer gets stored verbatim as the "category"
+# (which broke duplicate-detection, since two tickets about the same VPN
+# issue could end up with different literal category strings), and every
+# displayed/stored category value is guaranteed to be one of a small,
+# predictable set.
+
+ALLOWED_CATEGORIES = list(CATEGORIES)
+
+
+def normalize_category(raw_text: str) -> Dict[str, Optional[str]]:
+    """Parse a category/alias and optional description; unknown input needs clarification."""
+    category, description = category_answer(raw_text)
+    return {"category": category, "leftover": description}
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +173,64 @@ def verify_employee(employee_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool 4: Ticket Escalation
+# ---------------------------------------------------------------------------
+
+NON_ESCALATABLE_STATUSES = {"resolved", "closed"}
+
+
+def escalate_ticket(ticket_id: str, reason: str, requesting_employee_id: Optional[str] = None) -> Dict[str, Any]:
+    """Escalates an existing ticket: bumps priority to High and records why.
+
+    Guardrails (mirroring create_ticket's validation style):
+      - Ticket must exist -- never invents one.
+      - A valid requesting employee ID is required; the ticket must belong to them
+        (an employee shouldn't be able to escalate someone else's ticket).
+      - A resolved/closed ticket can't be escalated.
+      - Escalating an already-escalated ticket is a no-op, not a duplicate
+        action -- mirrors create_ticket's duplicate-prevention pattern.
+    """
+    if not ticket_id or not str(ticket_id).strip():
+        return {"success": False, "error": "Missing ticket ID to escalate.", "ticket": None}
+    if not reason or not str(reason).strip():
+        return {"success": False, "error": "Missing a reason for the escalation.", "ticket": None}
+
+    if not requesting_employee_id or not db.find_employee(requesting_employee_id):
+        return {"success": False, "error": "A valid employee ID is required for escalation.", "ticket": None}
+
+    matches = db.find_tickets(employee_id=requesting_employee_id, ticket_id=ticket_id)
+    if not matches:
+        return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "ticket": None}
+    ticket = matches[0]
+
+    if ticket.get("status", "").lower() in NON_ESCALATABLE_STATUSES:
+        return {
+            "success": False,
+            "error": f"Ticket {ticket['ticket_id']} is already {ticket['status']} and can't be escalated.",
+            "ticket": ticket,
+        }
+
+    if ticket.get("escalated"):
+        return {
+            "success": True,
+            "already_escalated": True,
+            "ticket": ticket,
+            "message": f"Ticket {ticket['ticket_id']} was already escalated on {ticket.get('escalated_at', 'an earlier date')}.",
+        }
+
+    updated = db.escalate_ticket(ticket_id, reason)
+    return {"success": True, "already_escalated": False, "ticket": updated}
+
+
+# ---------------------------------------------------------------------------
 # Bonus tool: System status
 # ---------------------------------------------------------------------------
+
+_STATUS_FRESHNESS_NOTE = (
+    "This reflects the last recorded status update in the system-status "
+    "data source, not a live real-time check performed just now."
+)
+
 
 def check_system_status(system_name: Optional[str] = None) -> Dict[str, Any]:
     statuses = db.get_system_status()
@@ -166,5 +242,5 @@ def check_system_status(system_name: Optional[str] = None) -> Dict[str, Any]:
         ]
         if not matches:
             return {"success": False, "error": f"No status information for '{system_name}'.", "results": []}
-        return {"success": True, "results": matches}
-    return {"success": True, "results": statuses}
+        return {"success": True, "results": matches, "note": _STATUS_FRESHNESS_NOTE}
+    return {"success": True, "results": statuses, "note": _STATUS_FRESHNESS_NOTE}

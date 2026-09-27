@@ -93,6 +93,7 @@ ROUTE_REQUEST_TOOL = {
                         "knowledge_search",
                         "ticket_lookup",
                         "ticket_creation",
+                        "escalation",
                         "system_status",
                         "general_chat",
                     ],
@@ -102,6 +103,9 @@ ROUTE_REQUEST_TOOL = {
                         "list/view/see ALL of their tickets (e.g. 'list my tickets', 'what tickets do "
                         "I have', 'show my open tickets', 'any tickets under my name'). "
                         "ticket_creation: user wants to REPORT a new issue / raise a ticket. "
+                        "escalation: user wants to ESCALATE an existing ticket -- raise its priority / "
+                        "get it urgent attention (e.g. 'escalate it', 'escalate ticket TCK-1005', 'this "
+                        "needs urgent attention', 'please bump the priority on my ticket'). "
                         "system_status: user is asking if a system/service is currently down. "
                         "general_chat: greetings, thanks, or anything not IT-support related."
                     ),
@@ -116,7 +120,7 @@ ROUTE_REQUEST_TOOL = {
                 },
                 "category": {
                     "type": ["string", "null"],
-                    "description": "Short issue category the user described, e.g. 'VPN', 'Laptop', 'Email', 'Printer'. Null if unclear.",
+                    "description": "ONLY for ticket_creation intent -- short issue category, e.g. 'VPN', 'Laptop', 'Email', 'Printer'. Null for every other intent, including system_status and knowledge_search, even if the message mentions a similar-sounding system.",
                 },
                 "description": {
                     "type": ["string", "null"],
@@ -130,6 +134,10 @@ ROUTE_REQUEST_TOOL = {
                 "search_query": {
                     "type": ["string", "null"],
                     "description": "For knowledge_search intent: the concise topic/question to search the knowledge base for.",
+                },
+                "escalation_reason": {
+                    "type": ["string", "null"],
+                    "description": "For escalation intent: the user's own reason for escalating (e.g. 'unresolved for too long', 'urgent business impact'). Null if not stated.",
                 },
             },
             "required": ["intent"],

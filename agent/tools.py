@@ -14,6 +14,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from . import db
+from .validation import CATEGORIES, canonical_category, category_answer
 
 STOP_WORDS = {
     "a", "an", "the", "is", "are", "my", "i", "to", "for", "of", "on", "in",
@@ -38,67 +39,13 @@ def _tokenize(text: str) -> List[str]:
 # displayed/stored category value is guaranteed to be one of a small,
 # predictable set.
 
-ALLOWED_CATEGORIES = [
-    "VPN", "Laptop", "Email", "Printer", "Software", "Internet",
-    "Mobile", "Account Access", "Hardware", "Network",
-]
-_CATEGORY_ALIASES = {
-    "wifi": "Network", "wi-fi": "Network", "wi fi": "Network",
-    "phone": "Mobile", "cell phone": "Mobile", "cellphone": "Mobile",
-    "pc": "Laptop", "computer": "Laptop", "desktop": "Laptop", "notebook": "Laptop",
-    "outlook": "Email", "mail": "Email", "e-mail": "Email",
-    "app": "Software", "application": "Software", "program": "Software",
-    "mfa": "Account Access", "2fa": "Account Access", "login": "Account Access",
-    "password": "Account Access",
-}
+ALLOWED_CATEGORIES = list(CATEGORIES)
 
 
 def normalize_category(raw_text: str) -> Dict[str, Optional[str]]:
-    """Extracts a known category from free-form text instead of storing the
-    raw text verbatim. Returns {"category": <one of ALLOWED_CATEGORIES or
-    "Other">, "leftover": <remaining text that looks like a description, or
-    None>}.
-
-    This lets a combined reply like "Printer, my printer prints blank pages"
-    (answering a single "what category?" question) split cleanly into a
-    valid category plus a separate description, instead of the entire
-    sentence becoming the category.
-    """
-    if not raw_text or not raw_text.strip():
-        return {"category": "Other", "leftover": None}
-
-    text = raw_text.strip()
-    text_lower = text.lower()
-    token_set = set(_tokenize(text))
-
-    matched = None
-    matched_phrase = None
-    for cat in ALLOWED_CATEGORIES:
-        cat_tokens = set(_tokenize(cat))
-        if cat_tokens and cat_tokens.issubset(token_set):
-            matched = cat
-            matched_phrase = cat
-            break
-    if not matched:
-        for alias, cat in _CATEGORY_ALIASES.items():
-            if alias in text_lower:
-                matched = cat
-                matched_phrase = alias
-                break
-
-    if not matched:
-        # Couldn't confidently identify a known category -- use the safe
-        # generic bucket rather than storing arbitrary free text as the
-        # category, but keep the user's own words as the description so
-        # nothing they said is silently discarded.
-        return {"category": "Other", "leftover": text}
-
-    leftover = re.sub(re.escape(matched_phrase), "", text, count=1, flags=re.IGNORECASE).strip(" ,.-:;")
-    leftover = re.sub(r"\s+", " ", leftover).strip()  # collapse any double-space left by the removal
-    if len(leftover) < 4:  # not enough left over to be a meaningful description
-        leftover = None
-
-    return {"category": matched, "leftover": leftover}
+    """Parse a category/alias and optional description; unknown input needs clarification."""
+    category, description = category_answer(raw_text)
+    return {"category": category, "leftover": description}
 
 
 # ---------------------------------------------------------------------------
@@ -143,27 +90,8 @@ def search_knowledge_base(query: str, top_k: int = 2) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def lookup_tickets(employee_id: Optional[str] = None, ticket_id: Optional[str] = None) -> Dict[str, Any]:
-    if not employee_id and not ticket_id:
-        return {
-            "success": False,
-            "error": "Need either an employee ID or a ticket ID to look up tickets.",
-            "results": [],
-        }
-
-    if ticket_id:
-        results = db.find_tickets(ticket_id=ticket_id)
-        if not results:
-            return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "results": []}
-
-        # Ownership check: if we know which employee is asking, the ticket
-        # must belong to them. Return the SAME "not found" message either
-        # way (don't first reveal the ticket exists/belongs to someone else
-        # and only then warn -- that's disclosure regardless of the wording
-        # attached to it).
-        if employee_id and results[0]["employee_id"].upper() != employee_id.strip().upper():
-            return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "results": []}
-
-        return {"success": True, "results": results}
+    if not employee_id:
+        return {"success": False, "error": "An employee ID is required for ticket lookup.", "results": []}
 
     # Employee-based lookup: employee must exist
     employee = db.find_employee(employee_id)
@@ -174,7 +102,7 @@ def lookup_tickets(employee_id: Optional[str] = None, ticket_id: Optional[str] =
             "results": [],
         }
 
-    results = db.find_tickets(employee_id=employee_id)
+    results = db.find_tickets(employee_id=employee_id, ticket_id=ticket_id)
     return {"success": True, "results": results, "employee": employee}
 
 
@@ -192,6 +120,8 @@ def validate_ticket_draft(draft: Dict[str, Any]) -> List[str]:
     for field in REQUIRED_TICKET_FIELDS:
         if not draft.get(field) or not str(draft.get(field)).strip():
             problems.append(field)
+    if draft.get("category") and not canonical_category(draft["category"]):
+        problems.append("category")
     return problems
 
 
@@ -209,14 +139,10 @@ def create_ticket(employee_id: str, category: str, description: str, priority: O
     if not employee:
         return {"success": False, "error": f"Cannot create ticket: unknown employee ID '{employee_id}'.", "ticket": None}
 
-    # Constrain category to the known set here too, not just in the graph's
-    # slot-filling step -- this function is the single point every ticket
-    # write goes through, so it's the most reliable place to guarantee a
-    # consistent, validated category regardless of how it was captured.
-    category = normalize_category(category)["category"]
-
     if not priority or priority.strip().lower() not in VALID_PRIORITIES:
         priority = "Medium"
+
+    category = canonical_category(category)
 
     # Duplicate prevention
     existing = db.find_open_ticket_for_category(employee_id, category)
@@ -258,7 +184,7 @@ def escalate_ticket(ticket_id: str, reason: str, requesting_employee_id: Optiona
 
     Guardrails (mirroring create_ticket's validation style):
       - Ticket must exist -- never invents one.
-      - If a requesting employee ID is given, the ticket must belong to them
+      - A valid requesting employee ID is required; the ticket must belong to them
         (an employee shouldn't be able to escalate someone else's ticket).
       - A resolved/closed ticket can't be escalated.
       - Escalating an already-escalated ticket is a no-op, not a duplicate
@@ -269,17 +195,13 @@ def escalate_ticket(ticket_id: str, reason: str, requesting_employee_id: Optiona
     if not reason or not str(reason).strip():
         return {"success": False, "error": "Missing a reason for the escalation.", "ticket": None}
 
-    matches = db.find_tickets(ticket_id=ticket_id)
+    if not requesting_employee_id or not db.find_employee(requesting_employee_id):
+        return {"success": False, "error": "A valid employee ID is required for escalation.", "ticket": None}
+
+    matches = db.find_tickets(employee_id=requesting_employee_id, ticket_id=ticket_id)
     if not matches:
         return {"success": False, "error": f"No ticket found with ID '{ticket_id}'.", "ticket": None}
     ticket = matches[0]
-
-    if requesting_employee_id and ticket["employee_id"].upper() != requesting_employee_id.strip().upper():
-        return {
-            "success": False,
-            "error": f"Ticket {ticket['ticket_id']} doesn't belong to employee '{requesting_employee_id}', so it can't be escalated from here.",
-            "ticket": None,
-        }
 
     if ticket.get("status", "").lower() in NON_ESCALATABLE_STATUSES:
         return {

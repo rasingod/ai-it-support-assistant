@@ -43,6 +43,7 @@ try:
 except Exception:
     pass
 
+from agent.llm_client import MODEL_NAME
 from agent.graph import get_graph
 from agent.state import new_state
 
@@ -75,9 +76,9 @@ if user_input:
         result_state = dict(state)
         result_state["final_response"] = (
             "Something went wrong while processing that request. Please try again. "
-            f"(Details: {exc})"
+            "No action is confirmed; retrying a creation checks for duplicates."
         )
-        result_state["error"] = str(exc)
+        result_state["error"] = "Request failed; please retry."
 
     answer = result_state.get("final_response") or "Sorry, I don't have a response for that."
     result_state.setdefault("messages", state["messages"])
@@ -92,6 +93,9 @@ if user_input:
 with st.sidebar:
     st.header("🛠️ IT Support Assistant")
     st.caption("Agentic AI demo built with LangGraph")
+    st.caption(f"Provider: OpenRouter | Configured model: {MODEL_NAME}")
+    st.caption("Fictional employee profiles; ID lookup is not authentication. Reset conversation to change profile.")
+    st.caption("Tickets use local JSON storage. Reset clears chat only; redeployments may reset tickets. System status is sample data, not live monitoring.")
 
     _api_key = os.environ.get("OPENROUTER_API_KEY", "").strip().strip('"').strip("'")
     if _api_key in ("", "your-openrouter-api-key-here"):
@@ -104,7 +108,7 @@ with st.sidebar:
     state = st.session_state.agent_state
     st.subheader("Session state")
     st.write("**Employee ID:**", state.get("employee_id") or "—")
-    st.write("**Verified:**", "✅" if state.get("employee_verified") else "—")
+    st.write("**Demo profile found:**", "✅" if state.get("employee_verified") else "—")
     st.write("**Awaiting:**", state.get("awaiting_field") or "—")
     ticket_draft = state.get("ticket_draft") or {}
     if ticket_draft:

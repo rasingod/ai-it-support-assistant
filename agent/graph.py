@@ -30,12 +30,14 @@ Each node is a plain function: (AgentState) -> partial AgentState update.
 Conditional edges are plain functions: (AgentState) -> str (name of next node).
 """
 
+import re
 from typing import Any, Dict
 
 from langgraph.graph import END, StateGraph
 
 from . import llm_client, tools
 from .state import AgentState
+from .validation import CATEGORIES, canonical_category, category_answer
 
 VALID_INTENTS = {"knowledge_search", "ticket_lookup", "ticket_creation", "escalation", "system_status", "general_chat"}
 
@@ -64,10 +66,13 @@ def _ask(state: AgentState, question: str, awaiting_field: str, pending_intent: 
 # ---------------------------------------------------------------------------
 
 def entry_router(state: AgentState) -> Dict[str, Any]:
-    """Pass-through node. Its only purpose is to exist as a clean START
-    target so the conditional edge below can inspect state before any
-    LLM call is made (saves a token spend when we're just filling a slot)."""
-    return {}
+    """Clear per-turn output and intercept cancellation before slot collection."""
+    update = {"creation_confirmed": False, "intent": None, "tool_name": None, "tool_result": None, "error": None, "final_response": ""}
+    if state["user_input"].strip().lower().strip(" .!") in CANCEL_PHRASES | {"reset"}:
+        update.update(ticket_draft={}, awaiting_field=None, pending_intent=None,
+                      intent="cancelled", ticket_id=None, search_query=None, escalation_reason=None,
+                      final_response="Pending request discarded. No saved tickets were changed.")
+    return update
 
 
 CANCEL_PHRASES = {
@@ -83,44 +88,28 @@ def fill_slot(state: AgentState) -> Dict[str, Any]:
     field = state.get("awaiting_field")
     value = state["user_input"].strip()
 
-    # Recognize a cancellation BEFORE treating the reply as a field value --
-    # otherwise "cancel" itself gets stored as the literal category/ticket
-    # ID/etc. Clears the whole in-progress draft rather than just the one
-    # field, since an abandoned request shouldn't leave partial state behind
-    # for a later, unrelated message to accidentally pick up.
-    if value.lower().strip(" .!") in CANCEL_PHRASES:
-        return {
-            "awaiting_field": None,
-            "pending_intent": None,
-            "intent": "cancelled",
-            "ticket_draft": {},
-            "ticket_id": None,
-            "escalation_reason": None,
-            "tool_name": None,
-            "tool_result": None,
-            "final_response": "No problem — I've cancelled that request. Let me know if there's anything else I can help with.",
-        }
-
     ticket_draft = dict(state.get("ticket_draft", {}))
     update: Dict[str, Any] = {"awaiting_field": None, "intent": state.get("pending_intent")}
 
     if field == "employee_id":
-        update["employee_id"] = value
+        match = re.search(r"\bEMP\d+\b", value, re.I)
+        update["employee_id"] = match.group().upper() if match else value
+        update["employee_verified"] = False
     elif field == "ticket_id":
         update["ticket_id"] = value
     elif field == "search_query":
         update["search_query"] = value
     elif field == "escalation_reason":
         update["escalation_reason"] = value
+    elif field == "confirmation":
+        if value.lower() != "confirm":
+            return {"awaiting_field": "confirmation", "intent": "ticket_creation"}
+        update["creation_confirmed"] = True
     elif field == "category":
-        # Constrain to a known category instead of storing the raw reply
-        # verbatim -- also recovers a description if the user answered
-        # "what category?" with both a category and extra detail in one
-        # sentence (e.g. "Printer, it's printing blank pages").
-        norm = tools.normalize_category(value)
-        ticket_draft["category"] = norm["category"]
-        if norm["leftover"] and not ticket_draft.get("description"):
-            ticket_draft["description"] = norm["leftover"]
+        category, description = category_answer(value)
+        ticket_draft["category"] = category
+        if description:
+            ticket_draft["description"] = description
         update["ticket_draft"] = ticket_draft
     elif field in ("description", "priority"):
         ticket_draft[field] = value
@@ -142,7 +131,7 @@ def classify_intent(state: AgentState) -> Dict[str, Any]:
     except Exception as exc:  # graceful failure per assignment requirements
         return {
             "intent": "general_chat",
-            "error": f"Intent classification failed: {exc}",
+            "error": "Intent classification unavailable or invalid.",
             "final_response": "I'm having trouble understanding that request right now. Could you rephrase it?",
         }
 
@@ -150,8 +139,11 @@ def classify_intent(state: AgentState) -> Dict[str, Any]:
 
     update: Dict[str, Any] = {"intent": intent, "error": None}
 
-    if route.get("employee_id"):
-        update["employee_id"] = route["employee_id"]
+    # Identity is established from explicit input, never changed by model output.
+    explicit_id = re.search(r"\bEMP\d+\b", state["user_input"], re.I)
+    if not state.get("employee_id") and explicit_id:
+        update["employee_id"] = explicit_id.group().upper()
+        update["employee_verified"] = False
 
     # Unlike employee_id (which should stay "sticky" for the whole session so
     # the user doesn't have to repeat it), ticket_id must NOT persist across
@@ -172,28 +164,20 @@ def classify_intent(state: AgentState) -> Dict[str, Any]:
 
     if intent == "escalation":
         update["escalation_reason"] = route.get("escalation_reason") or None
-    elif route.get("escalation_reason"):
-        update["escalation_reason"] = route["escalation_reason"]
 
-    # Only populate/mutate the ticket draft when the CURRENT intent is
-    # actually ticket_creation. Without this gate, an unrelated question
-    # (e.g. a system-status check) could leave a stray category/description
-    # sitting in ticket_draft -- visible in the UI and liable to leak into a
-    # later, genuinely unrelated ticket-creation flow -- if the classifier
-    # ever populates those optional fields for a different intent.
     if intent == "ticket_creation":
         ticket_draft = dict(state.get("ticket_draft", {}))
         if route.get("category"):
-            norm = tools.normalize_category(route["category"])
-            ticket_draft["category"] = norm["category"]
-            if norm["leftover"] and not route.get("description") and not ticket_draft.get("description"):
-                ticket_draft["description"] = norm["leftover"]
-        if route.get("description"):
-            ticket_draft["description"] = route["description"]
-        if route.get("priority"):
-            ticket_draft["priority"] = route["priority"]
-        if ticket_draft:
-            update["ticket_draft"] = ticket_draft
+            category, description = category_answer(route["category"])
+            ticket_draft["category"] = category
+            if description:
+                ticket_draft["description"] = description
+        for field in ("description", "priority"):
+            if route.get(field):
+                ticket_draft[field] = route[field]
+        update["ticket_draft"] = ticket_draft
+    if intent == "system_status":
+        update["search_query"] = route.get("search_query") or state["user_input"]
 
     return update
 
@@ -211,17 +195,17 @@ def ticket_lookup_node(state: AgentState) -> Dict[str, Any]:
     employee_id = state.get("employee_id")
     ticket_id = state.get("ticket_id")
 
-    if not employee_id and not ticket_id:
+    if not employee_id:
         return _ask(
             state,
-            "Sure -- what's your employee ID (or the ticket ID) so I can look that up?",
+            "Sure -- what's your employee ID so I can look that up?",
             "employee_id",
             "ticket_lookup",
         )
 
     result = tools.lookup_tickets(employee_id=employee_id, ticket_id=ticket_id)
 
-    if not result["success"] and employee_id and not ticket_id:
+    if not result["success"] and not tools.verify_employee(employee_id)["success"]:
         # Unknown employee ID -- ask them to re-confirm rather than guessing
         return _ask(
             state,
@@ -246,21 +230,16 @@ def ticket_creation_node(state: AgentState) -> Dict[str, Any]:
 
     # Step 1b: verify the employee actually exists (never create a ticket
     # for an ID we can't confirm)
-    if not state.get("employee_verified"):
-        verify = tools.verify_employee(employee_id)
-        if not verify["success"]:
-            return _ask(
-                state,
-                f"I couldn't find employee ID '{employee_id}'. Could you re-check and re-enter it?",
-                "employee_id",
-                "ticket_creation",
-            )
+    verify = tools.verify_employee(employee_id)
+    if not verify["success"]:
+        return {**_ask(state, "Please enter a valid demo employee ID.", "employee_id", "ticket_creation"),
+                "employee_verified": False}
 
     # Step 2: category
-    if not draft.get("category"):
+    if not canonical_category(draft.get("category")):
         return _ask(
             state,
-            "What category best describes the issue? (e.g. VPN, Laptop, Email, Printer, Software)",
+            "Choose a category: " + ", ".join(CATEGORIES) + ". You can add a description after a period.",
             "category",
             "ticket_creation",
         )
@@ -275,6 +254,14 @@ def ticket_creation_node(state: AgentState) -> Dict[str, Any]:
     )
     if missing:
         return _ask(state, f"I still need your {missing[0].replace('_', ' ')}.", missing[0], "ticket_creation")
+
+    draft = {**draft, "category": canonical_category(draft["category"]),
+             "description": draft["description"].strip(),
+             "priority": draft.get("priority") if str(draft.get("priority", "")).lower() in tools.VALID_PRIORITIES else "Medium"}
+    if not state.get("creation_confirmed"):
+        return {**_ask(state,
+            f"Review ticket for {employee_id}:\n\nCategory: {draft['category']}\n\nDescription: {draft['description']}\n\nPriority: {draft['priority']}\n\nType confirm to create or cancel to discard.",
+            "confirmation", "ticket_creation"), "ticket_draft": draft, "employee_verified": True}
 
     result = tools.create_ticket(
         employee_id=employee_id,
@@ -291,6 +278,8 @@ def ticket_creation_node(state: AgentState) -> Dict[str, Any]:
     if result.get("success"):
         # Clear the draft so a follow-up message doesn't accidentally reuse it
         update["ticket_draft"] = {}
+        update["pending_intent"] = None
+        update["awaiting_field"] = None
     return update
 
 
@@ -346,6 +335,8 @@ def escalate_ticket_node(state: AgentState) -> Dict[str, Any]:
         # this ticket/reason (same rationale as ticket_draft after creation).
         update["ticket_id"] = None
         update["escalation_reason"] = None
+        update["pending_intent"] = None
+        update["awaiting_field"] = None
     return update
 
 
@@ -356,77 +347,18 @@ def system_status_node(state: AgentState) -> Dict[str, Any]:
 
 
 def general_chat_node(state: AgentState) -> Dict[str, Any]:
-    system_prompt = (
-        "You are a friendly, concise IT Support Assistant for a fictional company. "
-        "The user's message is not a specific IT request (e.g. it's a greeting or "
-        "thanks). Reply briefly. You may offer to help with exactly these things, "
-        "and nothing else, because these are the only tools that actually exist: "
-        "(1) search IT help articles, (2) check the status of an existing ticket, "
-        "(3) raise a new ticket, (4) escalate an existing ticket, (5) check system "
-        "status (VPN/Email/Wi-Fi/Printing). Never offer, promise, or imply any "
-        "other action -- e.g. editing/updating a ticket's details, sending "
-        "notifications, scheduling a callback, or cancelling an appointment -- "
-        "since no tool exists for those. Also never ask the user to 'confirm' an "
-        "action; ticket creation and escalation happen immediately once the "
-        "required details are collected, so there is no separate confirmation step."
-    )
-    try:
-        reply = llm_client.generate_reply(system_prompt, [{"role": "user", "content": state["user_input"]}])
-    except Exception as exc:
-        reply = "Hi! I can help you search IT help articles, check ticket status, or raise a new ticket. What do you need?"
-        return {"final_response": reply, "error": f"General chat generation failed: {exc}"}
-    return {"final_response": reply}
+    if state.get("error"):
+        return {}
+    return {"final_response": "I can search IT guidance, look up tickets for your demo employee profile, prepare a ticket for confirmation, escalate an existing ticket to High priority, or show sample system status. I cannot edit ticket details or cancel saved tickets, add comments, or send notifications."}
 
 
 def generate_response_node(state: AgentState) -> Dict[str, Any]:
-    """LLM call #2: turn a tool's raw result into a clear, user-friendly
-    answer. The LLM is only asked to *phrase* the already-retrieved data,
-    never to add new facts."""
-    tool_name = state.get("tool_name")
-    result = state.get("tool_result") or {}
-
-    system_prompt = (
-        "You are an IT Support Assistant. You will be given the name of a tool "
-        "that was just executed and its JSON result. Write a short, clear, "
-        "friendly response to the user based ONLY on that JSON data. "
-        "Do not invent any information (ticket IDs, statuses, article steps, "
-        "employee names, etc.) that is not present in the JSON. Do not add "
-        "reassurances, caveats, or claims (e.g. 'other systems should be "
-        "unaffected') that are not explicitly present in the JSON, even if they "
-        "seem like a reasonable inference. If the JSON includes a 'note' field, "
-        "convey it plainly rather than rephrasing away its meaning -- it often "
-        "clarifies things like data freshness. "
-        "If the JSON indicates an error or empty results, say so plainly and, "
-        "for ticket creation, never claim a ticket was created if it wasn't. "
-        "The only tools that exist are: search IT help articles, look up ticket "
-        "status, create a ticket, escalate a ticket, and check system status -- "
-        "never offer, promise, or imply any other action (updating a ticket's "
-        "details, sending notifications, scheduling a callback, cancelling an "
-        "appointment, etc.). Also never ask the user to 'confirm' something that "
-        "this tool result shows has already happened -- ticket creation and "
-        "escalation are immediate, one-step actions with no separate "
-        "confirmation stage."
-    )
-
-    user_message = (
-        f"Tool executed: {tool_name}\n"
-        f"Tool result (JSON):\n{result}\n\n"
-        f"Original user message: {state.get('user_input')}"
-    )
-
-    try:
-        reply = llm_client.generate_reply(system_prompt, [{"role": "user", "content": user_message}])
-    except Exception as exc:
-        reply = _fallback_response(tool_name, result)
-        return {"final_response": reply, "error": f"Response generation failed: {exc}"}
-
-    return {"final_response": reply}
+    """Render actual tool fields; the LLM classifies but cannot invent result facts."""
+    return {"final_response": _fallback_response(state.get("tool_name"), state.get("tool_result") or {})}
 
 
 def _fallback_response(tool_name: str, result: Dict[str, Any]) -> str:
-    """Deterministic, template-based fallback used only if the LLM call
-    itself fails -- keeps the app usable even without API access, and
-    satisfies the 'handle tool failures gracefully' requirement."""
+    """Render stored facts without a second generative call."""
     if not result.get("success", True):
         return f"Sorry, I ran into an issue: {result.get('error', 'unknown error')}"
 
@@ -434,7 +366,7 @@ def _fallback_response(tool_name: str, result: Dict[str, Any]) -> str:
         articles = result.get("results", [])
         if not articles:
             return "I couldn't find a knowledge-base article matching that. Could you rephrase, or would you like me to raise a ticket?"
-        lines = [f"- {a['title']} ({a['article_id']}): {a['content'][:150]}..." for a in articles]
+        lines = [f"- {a['title']} ({a['article_id']}): {a['content']}" for a in articles]
         return "Here's what I found:\n" + "\n".join(lines)
 
     if tool_name == "lookup_tickets":
@@ -449,7 +381,7 @@ def _fallback_response(tool_name: str, result: Dict[str, Any]) -> str:
         if result.get("duplicate"):
             return result.get("message", "An open ticket already exists for this issue.")
         if ticket:
-            return f"Done! Ticket {ticket['ticket_id']} has been raised ({ticket['category']}, priority: {ticket['priority']})."
+            return f"Done! Ticket {ticket['ticket_id']} has been raised ({ticket['category']}, priority: {ticket['priority']}, status: {ticket['status']}).\n{ticket['description']}"
         return "Sorry, I wasn't able to create the ticket."
 
     if tool_name == "escalate_ticket":
@@ -462,10 +394,8 @@ def _fallback_response(tool_name: str, result: Dict[str, Any]) -> str:
 
     if tool_name == "check_system_status":
         rows = result.get("results", [])
-        lines = [f"- {r['system']}: {r['status']} ({r['notes']})" for r in rows]
-        note = result.get("note")
-        text = "Current system status:\n" + "\n".join(lines)
-        return text + (f"\n\n({note})" if note else "")
+        lines = [f"- {r['system']}: {r['status']} ({r['notes']}) — Last incident: {r.get('last_incident') or 'not recorded'}" for r in rows]
+        return "Sample system status (local data, not a live availability check; refresh time unknown):\n" + "\n".join(lines)
 
     return "Done."
 
@@ -475,7 +405,7 @@ def _fallback_response(tool_name: str, result: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def route_after_entry(state: AgentState) -> str:
-    return "fill_slot" if state.get("awaiting_field") else "classify_intent"
+    return END if state.get("intent") == "cancelled" else ("fill_slot" if state.get("awaiting_field") else "classify_intent")
 
 
 def route_by_intent(state: AgentState) -> str:
@@ -528,7 +458,7 @@ def build_graph():
     graph.add_conditional_edges(
         "entry_router",
         route_after_entry,
-        {"fill_slot": "fill_slot", "classify_intent": "classify_intent"},
+        {END: END, "fill_slot": "fill_slot", "classify_intent": "classify_intent"},
     )
 
     graph.add_conditional_edges(

@@ -1,4 +1,5 @@
 # AI IT Support Assistant
+
 Live demo: https://ai-it-support-assistant-demo.streamlit.app/
 An agentic AI IT-support chatbot built with **LangGraph**, **LLM Function**, and **Streamlit**. It understands an employee's request, decides which tool it needs, executes that tool against local sample data, and returns a clear, grounded response — while holding onto context (like an employee ID) across multiple turns of conversation.
 
@@ -21,12 +22,12 @@ The assistant is built as a **LangGraph** state machine with five capabilities e
 | Tool | Purpose |
 |---|---|
 | `search_knowledge_base` | Searches a local IT knowledge base for how-to articles |
-| `lookup_tickets` | Looks up existing tickets by employee ID or ticket ID |
-| `create_ticket` | Creates a new ticket after validating required fields and checking for duplicates |
-| `escalate_ticket` | Escalates an existing ticket (raises priority to High) after verifying ownership |
-| `check_system_status` *(bonus)* | Reports current status of internal systems (VPN, Email, Wi-Fi, Printing) |
+| `lookup_tickets` | Looks up existing tickets within the selected employee profile, optionally filtered by ticket ID |
+| `create_ticket` | Creates a new ticket after reviewing and confirming validated fields and checking for duplicates |
+| `escalate_ticket` | Raises an owned active ticket to High priority after collecting a reason; repeated escalation is a no-op |
+| `check_system_status` *(bonus)* | Reports sample, non-live status of internal systems (VPN, Email, Wi-Fi, Printing) |
 
-An LLM call (Claude, via a forced tool call) classifies the user's intent and extracts only the information they explicitly stated. The graph then routes to the right tool node, executes it against local JSON data, and a second LLM call phrases the tool's raw result into a friendly reply. If required information is missing, the graph asks a clarifying question and remembers the answer on the next turn instead of restarting the conversation.
+An LLM call (the configured OpenRouter model, via a forced tool call) classifies the user's intent and extracts only the information they explicitly stated. The graph then routes to the right tool node, executes it against local JSON data, and deterministic templates display the tool's actual stored fields. If required information is missing, the graph asks a clarifying question and remembers the answer on the next turn instead of restarting the conversation.
 
 ## 3. Architecture Diagram
 
@@ -44,7 +45,7 @@ flowchart TD
     ROUTE -->|ticket_creation| CREATE[ticket_creation_node<br/>Tool: verify_employee + create_ticket]
     ROUTE -->|escalation| ESCALATE[escalate_ticket_node<br/>Tool: verify_employee + escalate_ticket]
     ROUTE -->|system_status| STATUS[system_status_node<br/>Tool: check_system_status]
-    ROUTE -->|general_chat| CHAT[general_chat_node<br/>LLM free-text reply]
+    ROUTE -->|general_chat| CHAT[general_chat_node<br/>Supported-capability help]
 
     KB --> CLAR1{needs_clarification?}
     LOOKUP --> CLAR2{needs_clarification?}
@@ -53,7 +54,7 @@ flowchart TD
     STATUS --> CLAR4{needs_clarification?}
 
     CLAR1 -->|yes: ask user| END1([END - clarifying question])
-    CLAR1 -->|no| GEN[generate_response_node<br/>LLM phrases tool result]
+    CLAR1 -->|no| GEN[generate_response_node<br/>Templates render stored facts]
     CLAR2 -->|yes| END1
     CLAR2 -->|no| GEN
     CLAR3 -->|yes| END1
@@ -73,7 +74,7 @@ flowchart TD
 
 - **Python 3.10+**
 - **LangGraph** — workflow orchestration (state graph, conditional routing)
-- **OpenRouter API** (OpenAI-compatible `chat.completions`) — intent classification (via forced tool/function-calling) and response generation; defaults to `anthropic/claude-3.5-sonnet` but any OpenRouter model slug works
+- **OpenRouter API** (OpenAI-compatible `chat.completions`) — intent classification (via forced tool/function-calling) ; defaults to `anthropic/claude-3.5-sonnet` with a tool-calling model configurable
 - **Streamlit** — chat UI
 - **Local JSON files** — employees, tickets, knowledge base, system status (no external DB needed)
 
@@ -159,7 +160,7 @@ Use the sidebar's **🔄 Reset conversation** button to clear state and start ov
 
 **Ticket creation with validation**
 > User: `My VPN is not working. Please raise a ticket.`
-> Assistant: `What's your employee ID?` → `EMP1002` → `What category best describes the issue?` → `VPN` → `Could you briefly describe the issue?` → *user describes it* →
+> Assistant: `What's your employee ID?` → `EMP1002` → `What category best describes the issue?` → `VPN` → `Could you briefly describe the issue?` → *user describes it* → *review draft* → `confirm` →
 > Assistant: `Done! Ticket TCK-1005 has been raised (VPN, priority: Medium).`
 
 **Duplicate prevention**
@@ -189,16 +190,15 @@ Use the sidebar's **🔄 Reset conversation** button to clear state and start ov
 - **The LLM never invents ticket data.** The classifier is explicitly instructed to return `null` for anything the user didn't state, and `ticket_creation_node` re-validates required fields in code (not via the LLM) before ever calling `create_ticket`.
 - **State-driven slot filling instead of giant prompts.** Rather than stuffing the whole conversation into every LLM call and hoping it remembers the employee ID, the graph tracks `awaiting_field` / `pending_intent` / `ticket_draft` explicitly in state, so `fill_slot` can resume a partially-completed ticket without even calling the LLM.
 - **Duplicate-ticket prevention lives in the tool layer**, not the prompt, so it can't be bypassed by a differently-phrased request — `create_ticket()` always checks for an existing open ticket in the same category before writing a new one.
-- **Escalation has its own guardrails, not just a status bump.** `escalate_ticket()` confirms the ticket exists, belongs to the requesting employee (never lets someone escalate another employee's ticket), isn't already Resolved/Closed, and isn't already escalated (treated as a no-op with a clear message, mirroring the duplicate-ticket pattern) — all before touching the data.
-- **Two-stage LLM usage.** One call decides *what* to do (classification), a second call decides *how to phrase* the already-retrieved result. This keeps the "brain" (decision-making) and the "voice" (user-facing phrasing) separate and makes each easier to reason about and test independently of the other.
-- **Deterministic fallback responses.** `_fallback_response()` in `graph.py` provides a template-based answer if the phrasing LLM call fails, so a transient API error degrades the experience rather than crashing it.
+- **Grounded output.** The LLM classifies requests; templates render tool facts and supported capabilities so generated wording cannot add status claims or promise notifications.
+- **Deterministic responses.** `_fallback_response()` in `graph.py` is the standard tool-result renderer. Classifier failures return a safe retry message without writing a ticket.
 - **JSON files instead of a real database.** Keeps the project runnable anywhere with zero setup, per the assignment's "achievable on a local machine" guidance. `db.py` isolates all file I/O, so swapping in SQLite later only requires changing that one module.
 
 ## 11. Limitations
 
 - Knowledge-base search uses simple keyword-overlap scoring, not embeddings/semantic search — good enough for a small local KB, but won't scale to a large, diverse article set.
 - No authentication — employee ID is trusted based on lookup only, mirroring a low-stakes internal tool, not a production identity system.
-- `st.session_state` (single browser session) is the only persistence layer; the app doesn't yet use LangGraph's built-in checkpointer, so state won't survive a server restart or work across multiple concurrent users.
+- Conversation state is per browser session and clears on reset/restart. Tickets are saved in local JSON, survive conversation reset, and may be lost on redeployment or replacement of the filesystem. JSON writes are not safe for concurrent production writers; use a transactional database before multi-user production use.
 - Ticket priority defaults to "Medium" unless the user explicitly states urgency; the assistant does not infer priority from issue severity.
 - Intent classification quality depends on the underlying LLM; ambiguous multi-intent messages (e.g. "check my ticket and also raise a new one") are handled as a single intent per turn.
 - `fill_slot` (used to answer a clarifying question) takes the reply as a single literal value for whatever one field was asked about, without an LLM call. If a reply crams in extra information (e.g. answering "which ticket?" with "TCK-1001, and it's urgent") only the ticket ID is captured as typed — the assistant will still ask the follow-up question for anything not captured, rather than silently dropping it, but it won't parse multiple fields out of one free-form sentence during slot-filling. Answering one question at a time avoids this.
@@ -226,15 +226,17 @@ Streamlit Cloud exposes secrets via `st.secrets`, not real environment variables
 
 Python · LangGraph (State, Nodes, Edges, Conditional Routing) · Agentic AI · Tool/Function Calling · State Management · Local JSON Data Integration · Prompt Engineering · Streamlit · Error Handling · Modular Architecture
 
-## 14. Security & Reliability Fixes (Post-Deployment QA Review)
 
-A structured QA pass against the deployed app surfaced six real issues, since fixed in code (not just prompt wording, except where noted):
+## Review fixes and regression checks
 
-1. **Cross-employee ticket disclosure.** `lookup_tickets()` now enforces that when an employee ID is known, a specific ticket ID lookup must belong to that employee — otherwise it returns the same generic "not found" message a nonexistent ticket would, rather than showing the record and warning afterward. Anonymous ticket-ID-only lookups (no employee context at all) are unchanged.
-2. **Cancellation wasn't recognized mid-flow.** Replying "cancel" while answering a clarifying question used to get stored as the literal field value (e.g. category `"cancel"`). `fill_slot()` now recognizes common cancellation phrases first, clears the entire in-progress draft, and confirms the cancellation — instead of continuing to collect fields for an abandoned request.
-3. **Confirmation-step wording mismatch.** Ticket creation and escalation have always been immediate, one-step actions once required fields are collected — there is no separate draft/confirm stage. Both LLM system prompts (`general_chat_node`, `generate_response_node`) now explicitly say so, so the assistant can no longer imply a "type confirm" step exists when it doesn't.
-4. **Combined category+description replies.** Answering "what category?" with a full sentence (e.g. "Printer, it's printing blank pages") used to store the whole sentence as the category, which also broke duplicate-ticket matching between differently-phrased reports of the same issue. `tools.normalize_category()` now maps free text to one of a fixed set of categories (`VPN`, `Laptop`, `Email`, `Printer`, `Software`, `Internet`, `Mobile`, `Account Access`, `Hardware`, `Network`, or `Other`), and recovers any leftover text as the description automatically. Applied consistently in `fill_slot`, `classify_intent`, and as a final safety net inside `create_ticket()` itself.
-5. **Capability overclaiming.** Responses sometimes offered to update a ticket, notify someone, or cancel an appointment — none of which are real tools. Both LLM system prompts now explicitly enumerate the five tools that actually exist and forbid offering, promising, or implying anything else.
-6. **Status freshness and draft pollution.** `check_system_status()` now returns an explicit `note` field clarifying its data is the last recorded update, not a live check just performed — and the response-generation prompt is told to convey that note plainly rather than adding its own unsupported reassurances (e.g. "other services should be unaffected"). Separately, `classify_intent()` now only writes to `ticket_draft` when the current intent is actually `ticket_creation`, so an unrelated question (like a status check) can no longer leave a stray ticket draft visible in the sidebar.
+The selected demo employee stays fixed for the session. Reset conversation to select another fictional profile. Ticket-ID lookup always requires an employee and filters ownership before returning any record. This is demo scoping, not authentication.
 
-**On identity, model, and persistence (documentation, not a code change):** the green "Verified" indicator and employee-ID lookup are a demo-appropriate mechanism, not real authentication — see Limitations above. Record the specific deployed commit hash and the `OPENROUTER_MODEL` value you're running alongside your submission, since the UI doesn't surface either. Ticket IDs and data are stored in a flat JSON file with no database behind it, so a fresh redeploy (or a host reboot on some platforms) starts from the committed `data/tickets.json` again — this is expected behavior for a local-file-based demo, not a durability bug, and is already called out in Limitations.
+Ticket creation collects a category and description, shows a draft, and writes only after exact `confirm`. `cancel` or `reset` discards pending work at any collection stage, including confirmation; it never cancels saved tickets. Category follow-ups accept `Printer. My printer prints blank pages.` or `Printer, my printer prints blank pages` as two fields. Category aliases such as phone, outlook, login, and computer are supported; unknown values require clarification. Allowed categories are VPN, Laptop, Email, Printer, Software, Internet, Mobile, Account Access, Wi-Fi, Network, Hardware, and Other. Invalid values are rejected at the storage boundary. Existing policy (one active ticket per employee/category) is preserved, rather than silently changing duplicate behavior.
+
+System status is seeded local sample data. Replies show the recorded incident date and explicitly say freshness is unknown. Status requests do not populate a ticket draft. Comments, editing ticket details, saved-ticket cancellation, appointments, and notifications are not supported.
+
+The sidebar shows OpenRouter and the configured model name, never credentials. Record the exact deployment commit when deploying; this branch does not update the public app automatically. See `docs/REVIEW_FIXES.md` for the source baseline and validation scope.
+
+Run checks with `python -m pip install -r requirements-dev.txt`, then `python -m pytest -q` and `python -m compileall -q agent app.py`.
+
+Escalation requires a valid selected employee, an owned ticket, and a reason. Resolved/closed tickets are rejected; an already escalated ticket is unchanged. Once these fields are collected, escalation immediately raises priority to High and records the reason/time. It does not notify anyone or create a human hand-off. Common cancellation phrases such as `never mind`, `stop`, and `no thanks` discard any pending flow.

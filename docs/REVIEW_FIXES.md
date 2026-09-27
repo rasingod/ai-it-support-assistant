@@ -14,7 +14,7 @@ Source baseline: f7ca7029fbad842d7caff5625d0443f87400fe5e. Fix branch: `fix/depl
 | Status grounding and draft pollution | Display sample-data/freshness caveat and recorded incident timestamp. Status requests do not populate creation fields and do not reuse an earlier system query. |
 | Identity, model, persistence disclosure | Sidebar distinguishes demo profile lookup from authentication, shows configured OpenRouter model, and explains JSON persistence limits. |
 
-Additional safeguards clear transient results each turn, validate routing result field types, bound provider timeouts/retries, and suppress raw exception details in the UI. Existing data files, presentation, video, and keepalive workflows are unchanged.
+Additional safeguards clear transient results each turn, validate routing result field types, bound provider timeouts/retries, and suppress raw exception details in the UI. Main's seed-data and keepalive changes are preserved by the merge; this patch adds no sample tickets.
 
 ## Validation
 
@@ -27,3 +27,11 @@ This is still a fictional-data demo, not production authentication. Local JSON i
 Record the deployed commit when promoting this branch and keep the actual API key in environment variables or Streamlit Secrets. Never commit `.env` or `.streamlit/secrets.toml`.
 
 Validation on 15 September 2026: 18 tests passed with the repository's pinned dependencies (including Streamlit AppTest); pip check found no broken requirements; compilation and git diff --check passed. Two read-only live OpenRouter routing checks (VPN guidance and email status) also passed using the existing local configuration. This does not establish broad model accuracy or verify the deployed revision.
+
+## Main integration, 27 September 2026
+
+Resolved the conflicts with main while preserving escalation, expanded category aliases, and cancellation phrases. Creation still requires exact confirmation of a displayed draft. Escalation executes after collecting employee, owned ticket, and reason; anonymous and cross-employee escalation are rejected at the tool boundary. Already escalated tickets are unchanged, and resolved/closed tickets cannot be escalated.
+
+Shared validation accepts Internet, Mobile, and Account Access along with existing categories. Wi-Fi remains a distinct existing category to preserve matching against stored tickets. Unknown categories still require clarification instead of silently becoming Other. Combined category/description replies support commas as well as periods, colons, and semicolons. Aliases match whole words so "app" cannot match "happening".
+
+Validation: 30 tests passed, including Streamlit AppTest and new coverage for escalation field collection, ownership, repeat actions, cancellation cleanup, and category aliases. Tests use temporary storage and mocked routing; this merge validation makes no new claim about live provider availability or deployed behavior.
